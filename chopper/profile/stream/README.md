@@ -29,6 +29,24 @@ One-shot end-to-end check (spins up both in-process, asserts data flows):
 python -m chopper.profile.stream --self-test
 ```
 
+## Try it with real data (replay a ts.pkl)
+
+Replay a real run's kernel timeline through the stream and render a per-GPU
+busy% view (needs pandas + matplotlib; both are chopper deps):
+
+```
+# Terminal A: consumer that renders a PNG when the stream ends
+python examples/streaming/plot_consumer.py --port 8900 --out stream_live.png
+
+# Terminal B: replay one iteration of a real trace over the socket
+python examples/streaming/replay_trace.py --pkl /path/to/ts.pkl --port 8900
+```
+
+Busy% here is derived from real kernel start/end times (union of intervals per
+time bin), so a training trace shows the GPU near fully busy with real
+per-GPU straggler dips. Counter-derived metrics (util/freq/BW) need a device
+sampler `counter_samples.csv`; point `--follow` at one for those.
+
 ## Pieces
 
 - `metrics.py` : counter deltas -> instantaneous metrics. Same formulas as

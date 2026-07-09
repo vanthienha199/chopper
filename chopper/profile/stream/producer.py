@@ -91,5 +91,26 @@ class StreamProducer:
         self._sink.emit(record)
         return record
 
+    def push_activity(
+        self, gpu: int, t_ns: int, window_ns: int, busy_pct: float, n_kernels: int
+    ) -> dict[str, Any]:
+        """Emit a GPU busy/idle record for one time window.
+
+        Used when the source is a kernel timeline (no HW counters), e.g.
+        replaying a real ts.pkl. ``busy_pct`` is the fraction of the window
+        covered by kernel execution on this GPU.
+        """
+        record = {
+            "type": "gpu_activity",
+            "source": self._source,
+            "gpu": gpu,
+            "t_ns": t_ns,
+            "window_ns": window_ns,
+            "busy_pct": busy_pct,
+            "n_kernels": n_kernels,
+        }
+        self._sink.emit(record)
+        return record
+
     def close(self) -> None:
         self._sink.close()
