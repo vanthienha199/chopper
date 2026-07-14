@@ -604,7 +604,102 @@ def merge_device_counters(device_dir, output):
     logger.info(f"  Counter -> group: {counter_to_group}")
 
 
-def main(traces, pickles, counters, device_dir, output):
+def _gpu_busy_per_bin(starts, ends, t0, bin_ns, n_bins):
+    """Fraction of each time bin covered by kernel execution (union of intervals).
+
+    Overlapping kernels (concurrent compute/comm streams) are merged so a bin is
+    never counted past 100%. starts/ends are ns in the rocprofiler clock domain.
+    """
+    order = starts.argsort()
+    s = (starts[order] - t0)
+    e = (ends[order] - t0)
+    # merge overlapping intervals
+    merged = []
+    cs, ce = int(s[0]), int(e[0])
+    for i in range(1, len(s)):
+        si, ei = int(s[i]), int(e[i])
+        if si <= ce:
+            ce = max(ce, ei)
+        else:
+            merged.append((cs, ce))
+            cs, ce = si, ei
+    merged.append((cs, ce))
+
+    busy = np.zeros(n_bins)
+    for cs, ce in merged:
+        lo_bin = max(0, cs // bin_ns)
+        hi_bin = min(n_bins - 1, ce // bin_ns)
+        for b in range(lo_bin, hi_bin + 1):
+            lo = b * bin_ns
+            hi = lo + bin_ns
+            busy[b] += max(0, min(ce, hi) - max(cs, lo))
+    return 100.0 * busy / bin_ns
+
+
+def merge_cpu_gpu_timeline(cpu_pkl, kernel_csv, output, bin_ms=10):
+    """Join CPU telemetry and the GPU kernel timeline on the shared clock.
+
+    When cpu.pkl is collected with --cpu-clock rocprofiler, its timestamps are in
+    the same domain as the device sampler's kernel_traces.csv (both from
+    rocprofiler_get_timestamp). This bins both into fixed windows and reports, per
+    bin: mean CPU utilization (averaged over cores) and GPU busy% (fraction of the
+    bin covered by kernel execution). The result is the CPU-and-GPU-on-one-timeline
+    view: when GPU is busy, CPU is typically idle and vice versa.
+    """
+    import pickle
+
+    cpu = pd.read_pickle(cpu_pkl)
+    domain = cpu.attrs.get("clock_domain")
+    if domain != "rocprofiler":
+        logger.warning(
+            f"cpu.pkl clock_domain={domain!r} (expected 'rocprofiler'). "
+            "CPU and GPU axes may not align; re-collect with --cpu-clock rocprofiler."
+        )
+
+    k = pd.read_csv(kernel_csv)
+    bin_ns = bin_ms * 1_000_000
+
+    cpu_ts = cpu["ts"].to_numpy().astype("int64")
+    starts = k["start_ns"].to_numpy().astype("int64")
+    ends = k["end_ns"].to_numpy().astype("int64")
+
+    t0 = int(min(cpu_ts.min(), starts.min()))
+    t_end = int(max(cpu_ts.max(), ends.max()))
+    n_bins = (t_end - t0) // bin_ns + 1
+
+    # CPU: mean percent across cores per bin
+    cpu = cpu.copy()
+    cpu["bin"] = (cpu_ts - t0) // bin_ns
+    cpu_busy = cpu.groupby("bin")["percent"].mean()
+
+    gpu_busy = _gpu_busy_per_bin(starts, ends, t0, bin_ns, n_bins)
+
+    rows = []
+    for b in range(n_bins):
+        rows.append({
+            "t_ms": b * bin_ms,
+            "cpu_busy_pct": float(cpu_busy.get(b, 0.0)),
+            "gpu_busy_pct": float(gpu_busy[b]),
+        })
+    df = pd.DataFrame(rows)
+
+    result = {"timeline": df, "clock_domain": domain, "bin_ms": bin_ms}
+    with open(output, "wb") as f:
+        pickle.dump(result, f)
+
+    corr = df["cpu_busy_pct"].corr(df["gpu_busy_pct"])
+    logger.info(f"Wrote {output}: {n_bins} bins x {bin_ms}ms, clock={domain}")
+    logger.info(f"  mean CPU busy={df['cpu_busy_pct'].mean():.1f}% "
+                f"mean GPU busy={df['gpu_busy_pct'].mean():.1f}% "
+                f"CPU-GPU corr={corr:.2f}")
+
+
+def main(traces, pickles, counters, device_dir, output,
+         cpu_pkl=None, kernel_csv=None, bin_ms=10):
+    if cpu_pkl and kernel_csv:
+        merge_cpu_gpu_timeline(cpu_pkl, kernel_csv, output, bin_ms)
+        return
+
     if device_dir and pickles:
         assert len(pickles) == 1, "pass exactly one pickle with --device-dir"
         merge_device_with_traces(device_dir, pickles[0], output)
@@ -666,6 +761,7 @@ if __name__ == '__main__':
         "  3) -p ts.pkl -c batch0/*.csv -o out.pkl            (add counters)\n"
         "  4) --device-dir outputs/run -o device.pkl           (raw device CSVs)\n"
         "  5) --device-dir outputs/run -p ts.pkl -o merged.pkl (device + traces)\n"
+        "  6) --cpu-pkl cpu.pkl --kernel-csv kt.csv -o tl.pkl  (CPU+GPU timeline)\n"
     ))
     parser.add_argument('-t', '--traces', nargs='+')
     parser.add_argument('-p', '--pickles', nargs='+')
@@ -673,10 +769,19 @@ if __name__ == '__main__':
                         help='Counter CSV files (one -c per batch, sorted = GPU order)')
     parser.add_argument('--device-dir',
                         help='Device sampling output directory (chopper --device)')
+    parser.add_argument('--cpu-pkl',
+                        help='cpu.pkl (collect with --cpu-clock rocprofiler) for CPU+GPU timeline')
+    parser.add_argument('--kernel-csv',
+                        help='Device sampler kernel_traces.csv for CPU+GPU timeline')
+    parser.add_argument('--bin-ms', type=int, default=10,
+                        help='Time bin size for CPU+GPU timeline (default 10ms)')
     parser.add_argument('-o', '--output', required=True)
     args = parser.parse_args()
     main(sorted(args.traces) if args.traces else None,
          sorted(args.pickles) if args.pickles else None,
          args.counters,
          args.device_dir,
-         args.output)
+         args.output,
+         args.cpu_pkl,
+         args.kernel_csv,
+         args.bin_ms)
