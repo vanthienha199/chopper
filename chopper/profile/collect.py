@@ -13,7 +13,8 @@ def main(program,
          device,
          telemetry_on=0.0,
          telemetry_off=0.1,
-         sample_ms=1):
+         sample_ms=1,
+         cpu_clock="monotonic"):
     if len(program) == 0:
         logger.error("Please pass a program to run")
         return -1
@@ -28,6 +29,7 @@ def main(program,
             outdir=outdir,
             on=telemetry_on,
             off=telemetry_off,
+            cpu_clock=cpu_clock,
         )
     if gpu_telemetry:
         from chopper.profile.telemetry import gpu
@@ -125,6 +127,14 @@ if __name__ == "__main__":
         help='Device counter sampling interval in ms (default: 1, only used with --device)'
     )
     parser.add_argument(
+        '--cpu-clock',
+        choices=['monotonic', 'rocprofiler'],
+        default='monotonic',
+        help='Clock domain for CPU telemetry timestamps. "rocprofiler" aligns '
+             'CPU samples with GPU kernel traces (needs ROCm); falls back to '
+             'monotonic if unavailable.'
+    )
+    parser.add_argument(
         '--telemetry-on',
         type=float,
         default=0.0,
@@ -154,4 +164,5 @@ if __name__ == "__main__":
         args.telemetry_on,
         args.telemetry_off,
         args.sample_ms,
+        args.cpu_clock,
     ))
