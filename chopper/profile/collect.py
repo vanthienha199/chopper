@@ -13,7 +13,8 @@ def main(program,
          device,
          telemetry_on=0.0,
          telemetry_off=0.1,
-         sample_ms=1):
+         sample_ms=1,
+         vendor="auto"):
     if len(program) == 0:
         logger.error("Please pass a program to run")
         return -1
@@ -30,11 +31,19 @@ def main(program,
             off=telemetry_off,
         )
     if gpu_telemetry:
-        from chopper.profile.telemetry import gpu
+        from chopper.profile.telemetry.detect import resolve_vendor, Vendor
+        vend = resolve_vendor(vendor)
+        if vend is Vendor.UNKNOWN and nvidia:
+            vend = Vendor.NVIDIA
+        if vend is Vendor.NVIDIA:
+            from chopper.profile.telemetry import gpu_nvidia as gpu_mod
+        else:
+            from chopper.profile.telemetry import gpu as gpu_mod
+        logger.info(f"GPU telemetry backend: {vend.value}")
         runner.add(
-            gpu.main,
+            gpu_mod.main,
             False,
-            nvidia=nvidia,
+            nvidia=(vend is Vendor.NVIDIA),
             outdir=outdir,
             on=telemetry_on,
             off=telemetry_off,
@@ -87,7 +96,13 @@ if __name__ == "__main__":
         '--nvidia',
         action='store_true',
         required=False,
-        help='Not supported currently'
+        help='Force NVIDIA backend (superseded by --vendor auto-detect)'
+    )
+    parser.add_argument(
+        '--vendor',
+        choices=['auto', 'amd', 'nvidia'],
+        default='auto',
+        help='GPU vendor for telemetry backend (default auto-detect)'
     )
     parser.add_argument(
         '--cpu-telemetry',
@@ -154,4 +169,5 @@ if __name__ == "__main__":
         args.telemetry_on,
         args.telemetry_off,
         args.sample_ms,
+        args.vendor,
     ))
