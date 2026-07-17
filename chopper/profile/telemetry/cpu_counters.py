@@ -151,3 +151,78 @@ def main(
     df = pd.DataFrame(results)
     df.attrs["clock_domain"] = clock_domain
     df.to_pickle(f"{outdir}/{filename}")
+
+
+def measure_command(
+    program,
+    filename: str = "cpu_counters.pkl",
+    outdir: str = ".",
+    counters: tuple = ("instructions", "cpu_cycles", "cache_references", "cache_misses"),
+    cpu_clock: str = "monotonic",
+    off: float = 0.02,
+):
+    """Launch a workload and sample the CPU hardware counters of IT (not the
+    sampler). Counters are opened with inherit before the child is spawned, so
+    they accumulate the whole workload process tree. Produces a per-interval
+    time series stamped with the chosen clock, so CPU counters line up with the
+    GPU timeline just like the utilization side does.
+    """
+    import subprocess
+
+    if not is_available():
+        logger.warning("perf_event_open unavailable; running program without CPU counters")
+        subprocess.run(list(program))
+        return
+
+    from chopper.profile.telemetry.cpu import _resolve_clock
+    clock, clock_domain = _resolve_clock(cpu_clock)
+
+    fds = {}
+    for name in counters:
+        if name not in HW_COUNTERS:
+            continue
+        fd = _perf_event_open(HW_COUNTERS[name], 0, inherit=True)
+        if fd >= 0:
+            fds[name] = fd
+    if not fds:
+        logger.warning("no CPU counters opened; check perf_event_paranoid")
+        subprocess.run(list(program))
+        return
+    logger.info(f"measuring '{' '.join(program)}' with CPU counters {list(fds)} (clock={clock_domain})")
+
+    results = []
+    proc = subprocess.Popen(list(program))
+    while proc.poll() is None:
+        ts = clock()
+        row = {"ts": ts}
+        for name, fd in fds.items():
+            try:
+                row[name] = _read_counter(fd)
+            except OSError:
+                row[name] = None
+        results.append(row)
+        sleep(off)
+    proc.wait()
+
+    for fd in fds.values():
+        os.close(fd)
+    os.makedirs(outdir, exist_ok=True)
+    df = pd.DataFrame(results)
+    df.attrs["clock_domain"] = clock_domain
+    df.to_pickle(f"{outdir}/{filename}")
+    logger.info(f"wrote {outdir}/{filename}: {len(df)} samples")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Measure a workload's CPU hardware counters over time.")
+    parser.add_argument("--output-dir", default=".")
+    parser.add_argument("--filename", default="cpu_counters.pkl")
+    parser.add_argument("--cpu-clock", choices=["monotonic", "rocprofiler"], default="monotonic")
+    parser.add_argument("--off", type=float, default=0.02, help="sample interval seconds")
+    parser.add_argument("program", nargs="+", help="workload to run and measure")
+    args = parser.parse_args()
+    measure_command(args.program, args.filename, args.output_dir,
+                    cpu_clock=args.cpu_clock, off=args.off)
