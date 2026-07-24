@@ -213,6 +213,81 @@ def measure_command(
     logger.info(f"wrote {outdir}/{filename}: {len(df)} samples")
 
 
+_PERF_EVENTS = ("instructions", "cpu-cycles", "cache-references",
+                "cache-misses", "branches", "branch-misses")
+
+
+def attach_pid(
+    pid: int,
+    filename: str = "cpu_counters.pkl",
+    outdir: str = ".",
+    cpu_clock: str = "monotonic",
+    interval_ms: int = 200,
+    duration_s: float = 0.0,
+):
+    """Attach to an ALREADY-RUNNING process (e.g. a vLLM server) and record its
+    CPU hardware counters over time, without launching it.
+
+    Uses `perf stat -p <pid> -I` under the hood because it correctly attaches to
+    all threads of a running process (perf_event_open with inherit only catches
+    future children, not existing sibling threads). Each interval is stamped with
+    the chosen clock so it lines up with the GPU timeline. Linux + perf only.
+
+    This is the hook for profiling Suhas's vLLM run: start his server, get its
+    pid, attach.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("perf") is None:
+        logger.warning("perf tool not found; cannot attach to pid")
+        return
+    from chopper.profile.telemetry.cpu import _resolve_clock
+    clock, clock_domain = _resolve_clock(cpu_clock)
+
+    events = ",".join(e + ":u" for e in _PERF_EVENTS)  # user-space, unprivileged
+    cmd = ["perf", "stat", "-p", str(pid), "-I", str(interval_ms), "-x", ",", "-e", events]
+    logger.info(f"attaching perf to pid {pid}, events {_PERF_EVENTS} (clock={clock_domain})")
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
+
+    rows: dict = {}
+    end_at = None
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        parts = line.strip().split(",")
+        # interval CSV: <time>,<value>,<unit>,<event>,<run>,<pct>,...
+        if len(parts) < 4:
+            continue
+        try:
+            itime = float(parts[0])
+        except ValueError:
+            continue
+        val = parts[1]
+        event = parts[3].split(":")[0]
+        row = rows.setdefault(itime, {"ts": clock(), "perf_interval_s": itime})
+        try:
+            row[event] = int(val)
+        except ValueError:
+            row[event] = None
+        if end_at is None and duration_s > 0:
+            end_at = time_monotonic() + duration_s
+        if end_at is not None and time_monotonic() >= end_at:
+            proc.terminate()
+            break
+    proc.wait()
+
+    os.makedirs(outdir, exist_ok=True)
+    df = pd.DataFrame(list(rows.values()))
+    df.attrs["clock_domain"] = clock_domain
+    df.to_pickle(f"{outdir}/{filename}")
+    logger.info(f"wrote {outdir}/{filename}: {len(df)} intervals from pid {pid}")
+
+
+def time_monotonic() -> float:
+    from time import monotonic
+    return monotonic()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -222,7 +297,16 @@ if __name__ == "__main__":
     parser.add_argument("--filename", default="cpu_counters.pkl")
     parser.add_argument("--cpu-clock", choices=["monotonic", "rocprofiler"], default="monotonic")
     parser.add_argument("--off", type=float, default=0.02, help="sample interval seconds")
-    parser.add_argument("program", nargs="+", help="workload to run and measure")
+    parser.add_argument("--attach", type=int, metavar="PID",
+                        help="attach to an already-running process instead of launching one")
+    parser.add_argument("--interval-ms", type=int, default=200, help="perf interval for --attach")
+    parser.add_argument("--duration", type=float, default=0.0, help="seconds to profile with --attach (0=until it exits)")
+    parser.add_argument("program", nargs="*", help="workload to run and measure")
     args = parser.parse_args()
-    measure_command(args.program, args.filename, args.output_dir,
-                    cpu_clock=args.cpu_clock, off=args.off)
+    if args.attach:
+        attach_pid(args.attach, args.filename, args.output_dir,
+                   cpu_clock=args.cpu_clock, interval_ms=args.interval_ms,
+                   duration_s=args.duration)
+    else:
+        measure_command(args.program, args.filename, args.output_dir,
+                        cpu_clock=args.cpu_clock, off=args.off)
