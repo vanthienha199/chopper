@@ -18,14 +18,25 @@ import sys
 import time
 
 
+_FAIL_MARKERS = ("Traceback (most recent call last)", "CalledProcessError",
+                 "RuntimeError", "Segmentation fault")
+
+
 def timed_runs(cmd: list, n: int, label: str) -> list:
     times = []
     for i in range(n):
         t0 = time.monotonic()
-        r = subprocess.run(cmd)
+        r = subprocess.run(cmd, capture_output=True, text=True)
         dt = time.monotonic() - t0
-        if r.returncode != 0:
-            print(f"[overhead] {label} run {i} exited {r.returncode}, excluding")
+        combined = r.stdout + r.stderr
+        # collect.py's collector processes can swallow a workload crash and
+        # still exit 0, which would count a broken run as a fast "success".
+        # Treat any error marker in the output as a failed run.
+        marker = next((m for m in _FAIL_MARKERS if m in combined), None)
+        if r.returncode != 0 or marker is not None:
+            why = f"exited {r.returncode}" if r.returncode != 0 else f"output contains {marker!r}"
+            print(f"[overhead] {label} run {i} FAILED ({why}), excluding")
+            sys.stdout.write(combined[-2000:])
             continue
         times.append(dt)
         print(f"[overhead] {label} run {i}: {dt:.3f}s")
