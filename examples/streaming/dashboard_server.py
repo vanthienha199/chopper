@@ -17,6 +17,7 @@ Modes:
 
 import argparse
 import json
+import os
 import queue
 import socket
 import threading
@@ -139,15 +140,17 @@ def replay_source(cpu_pkl, kernel_csv, bin_ms=50, tick_ms=60):
     cpu_busy = cpu.groupby("bin")["percent"].mean()
     gpu = _gpu_busy_series(starts, ends, t0, bin_ns, n_bins)
     cpu_series = np.array([float(cpu_busy.get(b, 0.0)) for b in range(n_bins)])
+    clock_domain = cpu.attrs.get("clock_domain")
+    src = os.environ.get("CHOPPER_DASH_SRC", f"real run (clock={clock_domain})")
     print(f"[dashboard] replaying {n_bins} bins from a real run "
-          f"(clock={cpu.attrs.get('clock_domain')})")
+          f"(clock={clock_domain})")
 
     def run():
         while True:
             for b in range(n_bins):
                 publish({"type": "tl", "t": round(b * bin_ms / 1000.0, 3),
                          "cpu": round(cpu_series[b], 1), "gpu": round(float(gpu[b]), 1),
-                         "src": "real MI210 run"})
+                         "src": src})
                 time.sleep(tick_ms / 1000.0)
             time.sleep(0.8)
     threading.Thread(target=run, daemon=True).start()
