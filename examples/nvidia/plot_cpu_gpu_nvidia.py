@@ -4,6 +4,7 @@ Both are on the CUPTI clock, so this is the NVIDIA equivalent of the AMD
 merge_cpu_gpu_timeline demo: per time bin, mean CPU utilization and GPU busy%
 (union of kernel intervals). Shows the CPU/GPU trade-off on one shared clock.
 """
+import os
 import sys
 
 import matplotlib
@@ -65,7 +66,8 @@ ax.plot(t, gpu, lw=1.4, color="#76b900", label="GPU busy %")   # nvidia green
 ax.plot(t, cpu_series, lw=1.4, color="#2b6ec1", label="CPU busy % (mean core)")
 ax.set_xlabel("time (s), shared CUPTI clock")
 ax.set_ylabel("utilization (%)")
-ax.set_title(f"Chopper CPU+GPU on one timeline, NVIDIA H100 "
+device = os.environ.get("CHOPPER_NV_DEVICE", "NVIDIA GPU")
+ax.set_title(f"Chopper CPU+GPU on one timeline, {device} "
              f"(clock={dom}, CPU-GPU corr={corr:.2f})")
 ax.grid(True, alpha=0.3)
 ax.legend(loc="upper right")
