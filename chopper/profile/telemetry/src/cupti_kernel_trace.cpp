@@ -52,10 +52,30 @@ void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumReco
     // CUPTI requires 8-byte alignment; malloc already guarantees >= 16 on
     // glibc, so hand the pointer over as-is (an aligned-offset copy here made
     // the free() in bufferCompleted undefined behavior).
-    size_t s = 8 * 1024 * 1024;
+    //
+    // Small buffer on purpose: a record's kernel-name pointer references the
+    // owning module's name table, and JIT engines (Triton) load and replace
+    // modules mid-run. The longer records sit undelivered, the wider the
+    // window in which a module unload leaves pending name pointers dangling
+    // (native EngineCore death on DeltaAI GH200, first seen right as Triton
+    // JIT-compiled new kernels mid-inference). Small buffers + a periodic
+    // flush keep that window near zero.
+    size_t s = 1 * 1024 * 1024;
     *buffer = (uint8_t*)malloc(s);
     *size = s;
     *maxNumRecords = 0;
+}
+
+std::string csv_escape(const std::string& s) {
+    // Triton emits Python-derived kernel names (dots, <locals>, and
+    // potentially quotes); embedded quotes would break the CSV quoting.
+    std::string r;
+    r.reserve(s.size());
+    for (char c : s) {
+        if (c == '"') r += "\"\"";
+        else r += c;
+    }
+    return r;
 }
 
 void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer,
@@ -71,7 +91,7 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer,
             // InitializeInjection.
             auto* k = (CUpti_ActivityKernel9*)record;
             if (g_out) {
-                (*g_out) << "\"" << demangle(k->name) << "\","
+                (*g_out) << "\"" << csv_escape(demangle(k->name)) << "\","
                          << k->start << "," << k->end << ","
                          << (k->end - k->start) << "\n";
                 g_count++;
@@ -134,6 +154,11 @@ extern "C" int InitializeInjection(void) {
     if (cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL) != CUPTI_SUCCESS) {
         fprintf(stderr, "[cupti-trace] activity enable failed; tracing disabled\n");
         return 1;
+    }
+    // Deliver records promptly (default is only-when-full). Keeps pending
+    // records from outliving JIT module reloads; see bufferRequested.
+    if (cuptiActivityFlushPeriod(500) != CUPTI_SUCCESS) {
+        fprintf(stderr, "[cupti-trace] note: periodic flush unavailable, using buffer-full delivery\n");
     }
     g_active = true;
     atexit(finalize);
