@@ -97,6 +97,22 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer,
                 g_count++;
             }
         }
+#if CUPTI_API_VERSION >= 16
+        else if (record->kind == CUPTI_ACTIVITY_KIND_GRAPH_TRACE) {
+            // One record per CUDA graph launch instead of per kernel node.
+            // Graph-level start/end is what the GPU-busy timeline needs, and
+            // it avoids per-node instrumentation of graphs entirely (a driver
+            // segfault in cuGraphLaunch on DeltaAI GH200 when vLLM captured
+            // new graphs mid-inference while per-kernel tracing was active).
+            auto* g = (CUpti_ActivityGraphTrace*)record;
+            if (g_out) {
+                (*g_out) << "\"[cuda_graph " << g->graphId << "]\","
+                         << g->start << "," << g->end << ","
+                         << (g->end - g->start) << "\n";
+                g_count++;
+            }
+        }
+#endif
     }
     free(buffer);
 }
@@ -155,6 +171,24 @@ extern "C" int InitializeInjection(void) {
         fprintf(stderr, "[cupti-trace] activity enable failed; tracing disabled\n");
         return 1;
     }
+#if CUPTI_API_VERSION >= 16
+    // Graph-launched kernels are traced as ONE record per graph launch by
+    // default, not per kernel node. Per-node instrumentation of graphs
+    // segfaulted the CUDA driver (cuGraphLaunch, DeltaAI GH200, CUPTI 28)
+    // when vLLM captured new graphs mid-inference after a Triton JIT compile.
+    // Eager (non-graph) kernels are still traced individually. Set
+    // CHOPPER_NV_PER_KERNEL_GRAPHS=1 to opt back into per-node tracing.
+    const char* pk = getenv("CHOPPER_NV_PER_KERNEL_GRAPHS");
+    if (!(pk && pk[0] == '1')) {
+        if (cuptiActivityEnable(CUPTI_ACTIVITY_KIND_GRAPH_TRACE) != CUPTI_SUCCESS) {
+            fprintf(stderr, "[cupti-trace] note: graph-trace unavailable, "
+                            "graph kernels traced per node\n");
+        } else {
+            fprintf(stderr, "[cupti-trace] graph launches traced as single records "
+                            "(CHOPPER_NV_PER_KERNEL_GRAPHS=1 to override)\n");
+        }
+    }
+#endif
     // Deliver records promptly (default is only-when-full). Keeps pending
     // records from outliving JIT module reloads; see bufferRequested.
     if (cuptiActivityFlushPeriod(500) != CUPTI_SUCCESS) {
