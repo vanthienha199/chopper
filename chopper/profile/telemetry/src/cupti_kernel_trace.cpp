@@ -20,10 +20,18 @@
 //   - Multi-process servers (e.g. vLLM tensor parallel) inject this into
 //     every worker; with CHOPPER_NV_TRACE_PER_PID=1 each process writes
 //     <output>.<pid>.csv instead of all truncating one file.
+//   - Build against the CUDA toolkit the APP runs on, not whatever module the
+//     cluster loads. PyTorch wheels bundle their own toolkit (e.g.
+//     site-packages/nvidia/cu13); a CUPTI older than that runtime passes the
+//     version gate (compile == runtime lib) yet silently stops delivering
+//     activity buffers minutes into a CUDA-graph serving workload. The
+//     watchdog thread detects that stall and warns, but the records are lost;
+//     the only fix is rebuilding against the matching toolkit's CUPTI.
 #include <cupti.h>
 #include <cupti_version.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -31,12 +39,15 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 namespace {
 std::ofstream* g_out = nullptr;
 std::mutex g_mtx;
 std::atomic<uint64_t> g_count{0};
+std::atomic<uint64_t> g_buf_req{0};
+std::atomic<uint64_t> g_buf_done{0};
 bool g_active = false;
 
 std::string demangle(const char* name) {
@@ -64,6 +75,7 @@ void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxNumReco
     *buffer = (uint8_t*)malloc(s);
     *size = s;
     *maxNumRecords = 0;
+    g_buf_req++;
 }
 
 std::string csv_escape(const std::string& s) {
@@ -114,7 +126,56 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer,
         }
 #endif
     }
+    // Flush per delivered buffer (1MB granularity, cheap): the CSV on disk
+    // then always reflects everything CUPTI has delivered, so a hard kill or
+    // a wedged delivery thread can't strand rows in the stream buffer.
+    if (g_out) g_out->flush();
     free(buffer);
+    g_buf_done++;
+}
+
+// Watchdog, always on. Every 2s force a flush from our own thread and check
+// for the delivery-stall signature: CUPTI keeps REQUESTING buffers but stops
+// COMPLETING them (req climbs, done frozen), which is how a CUPTI older than
+// the app's CUDA runtime fails. It swallows buffers silently mid-run right as
+// serving switches to CUDA graphs (reproduced on ACES H100: CUPTI 12.2 under
+// torch's CUDA 13 runtime froze at 46k records with flushAll still returning
+// SUCCESS, while the matched CUPTI 13 build delivered 1.47M records from the
+// identical workload). flushAll cannot detect this, so the stall check is the
+// only tell. With CHOPPER_NV_TRACE_HEARTBEAT=1 also print counters per beat.
+void watchdog(bool verbose) {
+    uint64_t last = 0;
+    uint64_t last_done = 0;
+    int stalled_beats = 0;
+    bool warned = false;
+    while (g_active) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        CUptiResult rc = cuptiActivityFlushAll(0);
+        uint64_t n = g_count.load();
+        uint64_t req = g_buf_req.load(), done = g_buf_done.load();
+        if (verbose) {
+            fprintf(stderr,
+                    "[cupti-trace] hb pid=%d req=%llu done=%llu records=%llu (+%llu) flush_rc=%d\n",
+                    (int)getpid(), (unsigned long long)req,
+                    (unsigned long long)done, (unsigned long long)n,
+                    (unsigned long long)(n - last), (int)rc);
+        }
+        stalled_beats = (req > done + 8 && done == last_done) ? stalled_beats + 1 : 0;
+        if (stalled_beats >= 3 && !warned) {
+            warned = true;
+            fprintf(stderr,
+                    "[cupti-trace] WARNING pid %d: CUPTI stopped delivering activity "
+                    "buffers (%llu requested, %llu completed, records frozen at %llu). "
+                    "Kernel records from here on are LOST. Known cause: tracer built "
+                    "against a CUPTI older than the app's CUDA runtime (e.g. cluster "
+                    "CUDA module vs torch's bundled toolkit). Rebuild against the "
+                    "toolkit the app ships, e.g. site-packages/nvidia/cu13.\n",
+                    (int)getpid(), (unsigned long long)req,
+                    (unsigned long long)done, (unsigned long long)n);
+        }
+        last = n;
+        last_done = done;
+    }
 }
 
 void finalize() {
@@ -195,6 +256,8 @@ extern "C" int InitializeInjection(void) {
         fprintf(stderr, "[cupti-trace] note: periodic flush unavailable, using buffer-full delivery\n");
     }
     g_active = true;
+    const char* hb = getenv("CHOPPER_NV_TRACE_HEARTBEAT");
+    std::thread(watchdog, hb && hb[0] == '1').detach();
     atexit(finalize);
     fprintf(stderr, "[cupti-trace] pid %d injection initialized (CUPTI %u) -> %s\n",
             (int)getpid(), rt_version, out.c_str());
