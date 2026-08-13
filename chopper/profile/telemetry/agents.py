@@ -46,7 +46,10 @@ def _discover_tagged_roots(env_cache: dict[int, str | None]) -> dict[int, str]:
 
 
 def _attribute(pid: int, roots: dict[int, str], parent_of: dict[int, int]) -> str | None:
-    """Walk the ppid chain until a registered agent root (or give up)."""
+    """Walk the ppid chain until a registered agent root (or give up).
+    The NEAREST tagged ancestor wins, so a sub-agent tagged e.g.
+    CHOPPER_AGENT_ID=agentA.sub inside agentA's tree is attributed to the
+    sub-agent, not the parent."""
     seen: set[int] = set()
     while pid and pid not in seen:
         if pid in roots:
@@ -54,6 +57,29 @@ def _attribute(pid: int, roots: dict[int, str], parent_of: dict[int, int]) -> st
         seen.add(pid)
         pid = parent_of.get(pid, 0)
     return None
+
+
+def _cpu_topology() -> dict[int, dict[str, int]]:
+    """Map logical cpu -> {core: physical core id, package: socket id} from
+    sysfs. SMT siblings share (package, core). Empty on non-Linux."""
+    topo: dict[int, dict[str, int]] = {}
+    base = "/sys/devices/system/cpu"
+    try:
+        for entry in os.listdir(base):
+            if not (entry.startswith("cpu") and entry[3:].isdigit()):
+                continue
+            cpu = int(entry[3:])
+            try:
+                with open(f"{base}/{entry}/topology/core_id") as f:
+                    core = int(f.read())
+                with open(f"{base}/{entry}/topology/physical_package_id") as f:
+                    pkg = int(f.read())
+            except OSError:
+                continue
+            topo[cpu] = {"core": core, "package": pkg}
+    except OSError:
+        pass
+    return topo
 
 
 def main(
@@ -87,6 +113,7 @@ def main(
             sleep(off)
             continue
 
+        sweep_t0 = monotonic_ns()
         parent_of: dict[int, int] = {}
         procs: dict[int, Any] = {}
         for p in psutil.process_iter(["pid", "ppid", "name"]):
@@ -94,6 +121,7 @@ def main(
             procs[p.info["pid"]] = p
 
         ts = clock()
+        sweep_rows: list[dict[str, Any]] = []
         for pid, p in procs.items():
             agent = _attribute(pid, roots, parent_of)
             if agent is None:
@@ -106,15 +134,22 @@ def main(
             if pid not in primed:
                 primed.add(pid)  # first cpu_percent call is a meaningless 0
                 continue
-            results.append({
+            sweep_rows.append({
                 "ts": ts, "agent": agent, "pid": pid,
                 "name": p.info["name"], "cpu": cpu_num, "percent": pct,
             })
+        # sweep cost = the sampling-rate floor; ms on a quiet compute node,
+        # can approach 1s on a busy login node with thousands of processes
+        sweep_s = (monotonic_ns() - sweep_t0) / 1e9
+        for r in sweep_rows:
+            r["sweep_s"] = sweep_s
+        results.extend(sweep_rows)
         sleep(off)
 
     os.makedirs(outdir, exist_ok=True)
     df = pd.DataFrame(results)
     df.attrs["clock_domain"] = clock_domain
+    df.attrs["cpu_topology"] = _cpu_topology()
     df.to_pickle(f"{outdir}/{filename}")
     agents_seen = sorted(df["agent"].unique()) if len(df) else []
     logger.info(f"wrote {outdir}/{filename}: {len(df)} samples, agents {agents_seen}")
