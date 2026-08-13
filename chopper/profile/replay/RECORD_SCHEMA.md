@@ -6,7 +6,7 @@ each produced by the layer that already sees that data.
 
 ## 1. model_calls.jsonl  (produced by the proxy)
 
-One line per model call, in call order:
+One line per model call, in call order (proxy schema_version 8):
 
     {
       "turn": 3,
@@ -16,14 +16,29 @@ One line per model call, in call order:
       "prompt_tokens": 8123,
       "completion_tokens": 350,
       "prompt_sha256": "ab12...",          // hash of messages, for divergence check
-      "response": "...full text...",       // what the model answered
+      "response": "...full text...",       // text part, OFTEN EMPTY on tool turns
+      "tool_calls": [                      // structured tool calls, flat shape
+        {"name": "bash",
+         "arguments": "{\"command\": \"ls -R\"}",   // JSON string (or object)
+         "id": "chatcmpl-tool-..."}
+      ],
+      "finish_reasons": ["tool_calls"],    // list; first entry is used
+      "protocol": "openai",                // or "anthropic" (claude-code)
+      "stream": false,
       "model": "gpt-oss-120b"
     }
 
 The mocked endpoint (chopper.profile.replay.mock_endpoint) serves exactly
-this file back, FIFO, with the recorded timing.
+this file back, FIFO, with the recorded timing. Most agent turns carry
+empty text plus tool_calls (claude-code/codex especially); the mock returns
+them structured, in the protocol of the endpoint being asked:
+POST /v1/chat/completions -> OpenAI shape, POST /v1/messages -> Anthropic
+shape (text + tool_use content blocks), streaming and non-streaming both.
+Validated round-trip against real GH200 recordings (mini-swe-agent openai,
+claude-code anthropic).
 
-## 2. tool_calls.jsonl  (produced by the harness adapter)
+## 2. tool_calls.jsonl  (produced by the harness adapter; the proxy ships
+## this as a richer typed `actions.jsonl`, same idea)
 
 One line per tool execution, in execution order:
 

@@ -1,27 +1,41 @@
 """Mocked model endpoint for reproducible agent replay.
 
-Replays a recorded run's model responses over an OpenAI-compatible HTTP API,
-in order, with the recorded timing (time-to-first-token and total duration).
-Point a harness at this instead of vLLM and the CPU side of an agent run can
-be replayed deterministically: no GPU, no model variance, no network variance.
-This is the "mocked or recorded model endpoints" piece of the benchmark
-(hardware comparisons must not be confounded by model randomness), and the
-partner of the CPU-command replay log.
+Replays a recorded run's model responses over an OpenAI-compatible AND
+Anthropic-compatible HTTP API, in order, with the recorded timing
+(time-to-first-token and total duration). Point a harness at this instead of
+vLLM and the CPU side of an agent run can be replayed deterministically: no
+GPU, no model variance, no network variance. This is the "mocked or recorded
+model endpoints" piece of the benchmark (hardware comparisons must not be
+confounded by model randomness), and the partner of the CPU-command replay
+log.
 
-Recording format: JSONL, one object per model call, in call order:
+Recording format: JSONL, one object per model call, in call order. Matches
+the proxy's model_calls.jsonl (schema_version 8); minimal fields:
 
     {"turn": 0, "response": "...text...", "ttft_s": 0.42, "duration_s": 3.1,
+     "tool_calls": [{"name": "bash", "arguments": "{\"command\": \"ls\"}",
+                     "id": "chatcmpl-tool-..."}],
+     "finish_reasons": ["tool_calls"],
      "prompt_sha256": "ab12..." (optional), "model": "gpt-oss-120b" (optional)}
 
-Serving semantics (v1, single-agent replay):
+Most agent turns have EMPTY response text plus structured tool_calls
+(claude-code and codex especially); the mock returns those tool calls in the
+protocol's native shape, or the harness would stall waiting for a tool call
+that never comes. `arguments` may be a JSON string or an object. Legacy
+OpenAI-nested {"function": {"name", "arguments"}} entries are accepted too.
+
+Serving semantics (v2):
   - Responses are served strictly FIFO. If the recording had N calls, call
     N+1 returns HTTP 410 (recording exhausted).
+  - POST /v1/chat/completions answers in OpenAI shape; POST /v1/messages
+    answers in Anthropic shape (claude-code speaks this). Both support
+    stream=true; the protocol of the recorded call does not need to match
+    the endpoint being asked, the shape follows the REQUEST.
   - If prompt_sha256 is present, the incoming prompt is hashed and compared;
     a mismatch is logged loudly (the replayed harness diverged from the
     recording) but the response is still served, so a run never wedges.
-  - stream=true is supported: the first SSE chunk is delayed by ttft_s and
-    the remaining chunks are paced evenly across duration_s. Non-streaming
-    requests sleep ttft_s + duration_s, then return the whole body.
+  - Timing: first byte is delayed by ttft_s, the remaining content is paced
+    across duration_s. Non-streaming requests sleep ttft_s + duration_s.
   - --speed N divides all recorded delays by N (10 = fast replay, ~0 waits).
 
     python -m chopper.profile.replay.mock_endpoint --recording run1.jsonl \
@@ -35,6 +49,23 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+
+def _norm_tool_calls(raw: Any) -> list[dict[str, Any]]:
+    """Normalize recorded tool calls to [{id, name, arguments:str}]."""
+    out: list[dict[str, Any]] = []
+    for i, tc in enumerate(raw or []):
+        if "function" in tc:  # OpenAI-nested shape
+            name = tc["function"].get("name", "")
+            args = tc["function"].get("arguments", "{}")
+        else:  # proxy's flat shape
+            name = tc.get("name", "")
+            args = tc.get("arguments", "{}")
+        if not isinstance(args, str):
+            args = json.dumps(args)
+        out.append({"id": tc.get("id") or f"replay-tool-{i}",
+                    "name": name, "arguments": args})
+    return out
 
 
 class _Recording:
@@ -68,6 +99,19 @@ def _prompt_hash(body: dict[str, Any]) -> str:
         json.dumps(msgs, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def _finish_reason(call: dict[str, Any], tools: list[dict[str, Any]]) -> str:
+    fr = call.get("finish_reasons") or []
+    if isinstance(fr, str):
+        fr = [fr]
+    if fr:
+        return str(fr[0])
+    return "tool_calls" if tools else "stop"
+
+
+_ANTHROPIC_STOP = {"tool_calls": "tool_use", "stop": "end_turn",
+                   "length": "max_tokens"}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -89,6 +133,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def _sse(self, obj: dict[str, Any], event: str | None = None) -> None:
+        if event:
+            self.wfile.write(f"event: {event}\n".encode())
+        self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
+        self.wfile.flush()
+
     def do_POST(self) -> None:
         assert REC is not None
         n = int(self.headers.get("Content-Length", 0))
@@ -107,55 +157,160 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[mock-endpoint] WARNING call {REC.i - 1}: prompt hash "
                       f"mismatch (replay diverged from recording), serving anyway")
 
-        text = call.get("response", "")
+        text = call.get("response") or ""
+        tools = _norm_tool_calls(call.get("tool_calls"))
+        finish = _finish_reason(call, tools)
         ttft = float(call.get("ttft_s", 0.0)) / REC.speed
         dur = float(call.get("duration_s", 0.0)) / REC.speed
         model = call.get("model", "chopper-replay")
-        now = int(time.time())
-        rid = f"chatcmpl-replay-{REC.i - 1}"
+        usage_in = int(call.get("prompt_tokens", 0))
+        usage_out = int(call.get("completion_tokens", 0))
+        rid = f"replay-{REC.i - 1}"
+        anthropic = self.path.startswith("/v1/messages")
 
         if body.get("stream"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            time.sleep(ttft)
-            # pace the content evenly across the recorded duration
-            words = text.split(" ") or [""]
-            nchunks = min(len(words), 40)
-            per = max(1, len(words) // nchunks)
-            chunks = [" ".join(words[j:j + per]) + (" " if j + per < len(words) else "")
-                      for j in range(0, len(words), per)]
-            delay = dur / max(1, len(chunks))
-            for j, chunk in enumerate(chunks):
-                ev = {"id": rid, "object": "chat.completion.chunk", "created": now,
-                      "model": model, "choices": [{"index": 0, "delta":
-                          ({"role": "assistant", "content": chunk} if j == 0
-                           else {"content": chunk}), "finish_reason": None}]}
-                self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode())
-                self.wfile.flush()
-                time.sleep(delay)
-            done = {"id": rid, "object": "chat.completion.chunk", "created": now,
-                    "model": model, "choices": [{"index": 0, "delta": {},
-                                                 "finish_reason": "stop"}]}
-            self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            if anthropic:
+                self._stream_anthropic(rid, model, text, tools, finish,
+                                       ttft, dur, usage_in, usage_out)
+            else:
+                self._stream_openai(rid, model, text, tools, finish, ttft, dur)
         else:
             time.sleep(ttft + dur)
-            self._json(200, {
-                "id": rid, "object": "chat.completion", "created": now,
-                "model": model,
-                "choices": [{"index": 0, "message":
-                             {"role": "assistant", "content": text},
-                             "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": call.get("prompt_tokens", 0),
-                          "completion_tokens": call.get("completion_tokens", 0),
-                          "total_tokens": call.get("prompt_tokens", 0)
-                          + call.get("completion_tokens", 0)}})
+            if anthropic:
+                content: list[dict[str, Any]] = []
+                if text:
+                    content.append({"type": "text", "text": text})
+                for t in tools:
+                    content.append({"type": "tool_use", "id": t["id"],
+                                    "name": t["name"],
+                                    "input": json.loads(t["arguments"] or "{}")})
+                self._json(200, {
+                    "id": rid, "type": "message", "role": "assistant",
+                    "model": model, "content": content,
+                    "stop_reason": _ANTHROPIC_STOP.get(finish, finish),
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": usage_in,
+                              "output_tokens": usage_out}})
+            else:
+                msg: dict[str, Any] = {"role": "assistant",
+                                       "content": text if text else None}
+                if tools:
+                    msg["tool_calls"] = [
+                        {"id": t["id"], "type": "function",
+                         "function": {"name": t["name"],
+                                      "arguments": t["arguments"]}}
+                        for t in tools]
+                self._json(200, {
+                    "id": rid, "object": "chat.completion",
+                    "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "message": msg,
+                                 "finish_reason": finish}],
+                    "usage": {"prompt_tokens": usage_in,
+                              "completion_tokens": usage_out,
+                              "total_tokens": usage_in + usage_out}})
         print(f"[mock-endpoint] served call {REC.i - 1}/{len(REC.calls)} "
-              f"(ttft {ttft:.2f}s, dur {dur:.2f}s, stream={bool(body.get('stream'))})")
+              f"({'anthropic' if anthropic else 'openai'}, "
+              f"{len(tools)} tool_calls, finish={finish}, "
+              f"stream={bool(body.get('stream'))})")
+
+    def _paced_chunks(self, text: str) -> list[str]:
+        words = text.split(" ") or [""]
+        nchunks = min(len(words), 40)
+        per = max(1, len(words) // nchunks)
+        return [" ".join(words[j:j + per]) + (" " if j + per < len(words) else "")
+                for j in range(0, len(words), per)]
+
+    def _stream_openai(self, rid: str, model: str, text: str,
+                       tools: list[dict[str, Any]], finish: str,
+                       ttft: float, dur: float) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        time.sleep(ttft)
+        now = int(time.time())
+
+        def chunk(delta: dict[str, Any], fr: str | None = None) -> None:
+            self._sse({"id": rid, "object": "chat.completion.chunk",
+                       "created": now, "model": model,
+                       "choices": [{"index": 0, "delta": delta,
+                                    "finish_reason": fr}]})
+
+        parts = self._paced_chunks(text) if text else []
+        nevents = max(1, len(parts) + len(tools))
+        delay = dur / nevents
+        first = True
+        for p in parts:
+            d: dict[str, Any] = {"content": p}
+            if first:
+                d["role"] = "assistant"
+                first = False
+            chunk(d)
+            time.sleep(delay)
+        for ti, t in enumerate(tools):
+            d = {"tool_calls": [{"index": ti, "id": t["id"], "type": "function",
+                                 "function": {"name": t["name"],
+                                              "arguments": t["arguments"]}}]}
+            if first:
+                d["role"] = "assistant"
+                first = False
+            chunk(d)
+            time.sleep(delay)
+        chunk({}, finish)
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _stream_anthropic(self, rid: str, model: str, text: str,
+                          tools: list[dict[str, Any]], finish: str,
+                          ttft: float, dur: float,
+                          usage_in: int, usage_out: int) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        time.sleep(ttft)
+        self._sse({"type": "message_start", "message": {
+            "id": rid, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": usage_in, "output_tokens": 0}}},
+            "message_start")
+
+        parts = self._paced_chunks(text) if text else []
+        nevents = max(1, len(parts) + len(tools))
+        delay = dur / nevents
+        idx = 0
+        if parts:
+            self._sse({"type": "content_block_start", "index": idx,
+                       "content_block": {"type": "text", "text": ""}},
+                      "content_block_start")
+            for p in parts:
+                self._sse({"type": "content_block_delta", "index": idx,
+                           "delta": {"type": "text_delta", "text": p}},
+                          "content_block_delta")
+                time.sleep(delay)
+            self._sse({"type": "content_block_stop", "index": idx},
+                      "content_block_stop")
+            idx += 1
+        for t in tools:
+            self._sse({"type": "content_block_start", "index": idx,
+                       "content_block": {"type": "tool_use", "id": t["id"],
+                                         "name": t["name"], "input": {}}},
+                      "content_block_start")
+            self._sse({"type": "content_block_delta", "index": idx,
+                       "delta": {"type": "input_json_delta",
+                                 "partial_json": t["arguments"]}},
+                      "content_block_delta")
+            self._sse({"type": "content_block_stop", "index": idx},
+                      "content_block_stop")
+            time.sleep(delay)
+            idx += 1
+        self._sse({"type": "message_delta",
+                   "delta": {"stop_reason": _ANTHROPIC_STOP.get(finish, finish),
+                             "stop_sequence": None},
+                   "usage": {"output_tokens": usage_out}}, "message_delta")
+        self._sse({"type": "message_stop"}, "message_stop")
 
 
 def main() -> None:
@@ -169,7 +324,7 @@ def main() -> None:
     REC = _Recording(a.recording, a.speed)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print(f"[mock-endpoint] {len(REC.calls)} recorded calls, speed {a.speed}x, "
-          f"serving http://127.0.0.1:{a.port}/v1")
+          f"serving http://127.0.0.1:{a.port}/v1 (openai + anthropic)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
