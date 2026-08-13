@@ -109,6 +109,23 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer,
                 g_count++;
             }
         }
+        else if (record->kind == CUPTI_ACTIVITY_KIND_MARKER) {
+            // NVTX range boundaries (kernel -> LLM operator mapping). One row
+            // per boundary; offline merge pairs begin/end by marker id. The
+            // name pointer is only valid on the START record.
+            auto* m = (CUpti_ActivityMarker2*)record;
+            if (g_out) {
+                if (m->flags & CUPTI_ACTIVITY_FLAG_MARKER_START) {
+                    (*g_out) << "\"[nvtx_begin " << csv_escape(m->name ? m->name : "?")
+                             << " #" << m->id << "]\","
+                             << m->timestamp << "," << m->timestamp << ",0\n";
+                } else if (m->flags & CUPTI_ACTIVITY_FLAG_MARKER_END) {
+                    (*g_out) << "\"[nvtx_end #" << m->id << "]\","
+                             << m->timestamp << "," << m->timestamp << ",0\n";
+                }
+                g_count++;
+            }
+        }
 #if CUPTI_API_VERSION >= 16
         else if (record->kind == CUPTI_ACTIVITY_KIND_GRAPH_TRACE) {
             // One record per CUDA graph launch instead of per kernel node.
@@ -250,6 +267,28 @@ extern "C" int InitializeInjection(void) {
         }
     }
 #endif
+    // NVTX ranges (CHOPPER_NV_TRACE_NVTX=1): maps kernels to LLM operators.
+    // Two conditions must hold for ranges to flow: (1) marker activity is
+    // enabled here, (2) the app's NVTX calls are routed into CUPTI, which
+    // requires NVTX_INJECTION64_PATH pointing at the SAME libcupti this
+    // tracer is linked against. PyTorch emits NVTX per operator under
+    // torch.autograd.profiler.emit_nvtx(), or explicit
+    // torch.cuda.nvtx.range_push/pop in the model code.
+    const char* nvtx = getenv("CHOPPER_NV_TRACE_NVTX");
+    if (nvtx && nvtx[0] == '1') {
+        if (!getenv("NVTX_INJECTION64_PATH")) {
+            fprintf(stderr, "[cupti-trace] note: CHOPPER_NV_TRACE_NVTX=1 but "
+                            "NVTX_INJECTION64_PATH is unset; NVTX ranges will "
+                            "NOT reach CUPTI (set it to the libcupti .so)\n");
+        }
+        if (cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MARKER) != CUPTI_SUCCESS) {
+            fprintf(stderr, "[cupti-trace] note: marker activity unavailable, "
+                            "NVTX ranges not traced\n");
+        } else {
+            fprintf(stderr, "[cupti-trace] NVTX ranges traced as "
+                            "[nvtx_begin/nvtx_end] rows\n");
+        }
+    }
     // Deliver records promptly (default is only-when-full). Keeps pending
     // records from outliving JIT module reloads; see bufferRequested.
     if (cuptiActivityFlushPeriod(500) != CUPTI_SUCCESS) {
