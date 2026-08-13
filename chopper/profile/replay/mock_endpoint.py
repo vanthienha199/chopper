@@ -43,12 +43,16 @@ Serving semantics (v2):
 """
 
 import argparse
+import functools
 import hashlib
 import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+# unbuffered progress lines: the log must survive a hard kill of the replay
+print = functools.partial(print, flush=True)
 
 
 def _norm_tool_calls(raw: Any) -> list[dict[str, Any]]:
@@ -69,13 +73,17 @@ def _norm_tool_calls(raw: Any) -> list[dict[str, Any]]:
 
 
 class _Recording:
-    def __init__(self, path: str, speed: float):
+    def __init__(self, path: str, speed: float, task: str | None = None):
         self.calls: list[dict[str, Any]] = []
         with open(path) as f:
             for line in f:
                 line = line.strip()
                 if line:
                     self.calls.append(json.loads(line))
+        if task:
+            # replaying a single task: drop pipeline warmup calls and other
+            # tasks' calls, the harness never made those requests
+            self.calls = [c for c in self.calls if c.get("task_id") == task]
         self.speed = max(speed, 1e-9)
         self.i = 0
         self.lock = threading.Lock()
@@ -320,8 +328,10 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8123)
     p.add_argument("--speed", type=float, default=1.0,
                    help="divide recorded delays by this factor (10 = fast replay)")
+    p.add_argument("--task", default=None,
+                   help="serve only this task_id's calls (drops __warmup__ etc.)")
     a = p.parse_args()
-    REC = _Recording(a.recording, a.speed)
+    REC = _Recording(a.recording, a.speed, a.task)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print(f"[mock-endpoint] {len(REC.calls)} recorded calls, speed {a.speed}x, "
           f"serving http://127.0.0.1:{a.port}/v1 (openai + anthropic)")
