@@ -73,7 +73,8 @@ def _norm_tool_calls(raw: Any) -> list[dict[str, Any]]:
 
 
 class _Recording:
-    def __init__(self, path: str, speed: float, task: str | None = None):
+    def __init__(self, path: str, speed: float, task: str | None = None,
+                 journal: str | None = None):
         self.calls: list[dict[str, Any]] = []
         with open(path) as f:
             for line in f:
@@ -88,6 +89,15 @@ class _Recording:
         self.i = 0
         self.lock = threading.Lock()
         self.mismatches = 0
+        # the replay's own model_calls journal: REPLAY-time arrival stamps,
+        # so turn windows can be cut on the machine being measured (the
+        # recording's timestamps belong to the original machine)
+        self.journal = open(journal, "w") if journal else None
+
+    def log_served(self, entry: dict[str, Any]) -> None:
+        if self.journal:
+            self.journal.write(json.dumps(entry) + "\n")
+            self.journal.flush()
 
     def next_call(self) -> dict[str, Any] | None:
         with self.lock:
@@ -170,6 +180,14 @@ class Handler(BaseHTTPRequestHandler):
         finish = _finish_reason(call, tools)
         ttft = float(call.get("ttft_s", 0.0)) / REC.speed
         dur = float(call.get("duration_s", 0.0)) / REC.speed
+        REC.log_served({
+            "turn": call.get("turn", REC.i - 1),
+            "task_id": call.get("task_id"),
+            "ts_epoch_s": time.time(),
+            "ttft_s": ttft, "duration_s": dur,
+            "prompt_tokens": call.get("prompt_tokens", 0),
+            "completion_tokens": call.get("completion_tokens", 0),
+        })
         model = call.get("model", "chopper-replay")
         usage_in = int(call.get("prompt_tokens", 0))
         usage_out = int(call.get("completion_tokens", 0))
@@ -330,8 +348,11 @@ def main() -> None:
                    help="divide recorded delays by this factor (10 = fast replay)")
     p.add_argument("--task", default=None,
                    help="serve only this task_id's calls (drops __warmup__ etc.)")
+    p.add_argument("--journal", default=None,
+                   help="write the replay's own model_calls jsonl here "
+                        "(replay-time arrival stamps for turn windows)")
     a = p.parse_args()
-    REC = _Recording(a.recording, a.speed, a.task)
+    REC = _Recording(a.recording, a.speed, a.task, a.journal)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print(f"[mock-endpoint] {len(REC.calls)} recorded calls, speed {a.speed}x, "
           f"serving http://127.0.0.1:{a.port}/v1 (openai + anthropic)")
