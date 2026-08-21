@@ -1,0 +1,5 @@
+#!/bin/bash
+# Single-command benchmark runner (Samsung artifact). Thin wrapper around
+# chopper/profile/replay/run_benchmark.py; runs with whatever python3 is
+# active so cluster venvs work unchanged.
+exec python3 "$(dirname "$0")/chopper/profile/replay/run_benchmark.py" "$@"
