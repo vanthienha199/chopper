@@ -121,10 +121,16 @@ def decompose(model_calls: list[dict[str, Any]],
             # else: trace does not cover this window at all -> None
 
         other = max(total - covered, 0.0)
+        # model wait splits at the first token: ttft ~= queue + prefill,
+        # the rest of the response is decode (the reasoning generation)
+        prefill = min(float(c.get("ttft_s", 0.0)), model_s)
+        decode = max(model_s - prefill, 0.0)
         turns.append({
             "turn": c.get("turn", i), "t_start_epoch_s": t0,
             "total_s": round(total, 4),
             "model_wait_s": round(model_s, 4),
+            "prefill_s": round(prefill, 4),
+            "decode_s": round(decode, 4),
             "tool_exec_s": round(tool_excl, 4),
             "tool_during_model_s": round(tool_during_model, 4),
             "gpu_busy_s": None if gpu_s is None else round(gpu_s, 4),
@@ -139,6 +145,8 @@ def summarize(turns: list[dict[str, Any]]) -> dict[str, Any]:
         "n_turns": len(turns),
         "total_s": round(tot, 2),
         "model_wait_s": round(sum(t["model_wait_s"] for t in turns), 2),
+        "prefill_s": round(sum(t["prefill_s"] for t in turns), 2),
+        "decode_s": round(sum(t["decode_s"] for t in turns), 2),
         "tool_exec_s": round(sum(t["tool_exec_s"] for t in turns), 2),
         "tool_during_model_s": round(sum(t["tool_during_model_s"] for t in turns), 2),
         "gpu_busy_s": round(sum(t["gpu_busy_s"] or 0.0 for t in turns), 2),
@@ -168,7 +176,8 @@ def main() -> None:
 
     if a.out_csv:
         cols = ["turn", "t_start_epoch_s", "total_s", "model_wait_s",
-                "tool_exec_s", "tool_during_model_s", "gpu_busy_s", "other_s"]
+                "prefill_s", "decode_s", "tool_exec_s", "tool_during_model_s",
+                "gpu_busy_s", "other_s"]
         with open(a.out_csv, "w") as f:
             f.write(",".join(cols) + "\n")
             for t in turns:

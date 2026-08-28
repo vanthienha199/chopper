@@ -28,6 +28,7 @@ _NR_perf_event_open = 298
 
 # perf_event_attr.type
 PERF_TYPE_HARDWARE = 0
+PERF_TYPE_HW_CACHE = 3
 # perf_event_attr.config (PERF_TYPE_HARDWARE)
 HW_COUNTERS = {
     "cpu_cycles": 0,
@@ -36,6 +37,20 @@ HW_COUNTERS = {
     "cache_misses": 3,
     "branch_instructions": 4,
     "branch_misses": 5,
+}
+# per-level cache events (PERF_TYPE_HW_CACHE):
+# config = cache_id | (op_id << 8) | (result_id << 16). A miss at one level
+# is traffic INTO the next level, so per-level rooflines read: L1D accesses
+# = core-side traffic, L1D misses = L2 traffic, LLC misses = DRAM traffic.
+# Availability varies by CPU model; unsupported events are skipped with a
+# warning, never fatal.
+_C_L1D, _C_LL = 0, 2
+_OP_READ, _RES_ACCESS, _RES_MISS = 0, 0, 1
+HW_CACHE_COUNTERS = {
+    "l1d_read_access": _C_L1D | (_OP_READ << 8) | (_RES_ACCESS << 16),
+    "l1d_read_miss": _C_L1D | (_OP_READ << 8) | (_RES_MISS << 16),
+    "llc_read_access": _C_LL | (_OP_READ << 8) | (_RES_ACCESS << 16),
+    "llc_read_miss": _C_LL | (_OP_READ << 8) | (_RES_MISS << 16),
 }
 # flags bitfield offsets within perf_event_attr
 _F_DISABLED = 1 << 0
@@ -65,10 +80,11 @@ def is_available() -> bool:
     return platform.system() == "Linux" and platform.machine() in ("x86_64", "AMD64")
 
 
-def _perf_event_open(config: int, pid: int, inherit: bool) -> int:
+def _perf_event_open(config: int, pid: int, inherit: bool,
+                     type_: int = PERF_TYPE_HARDWARE) -> int:
     """Open one user-space HW counter. Returns an fd, or -1 on failure."""
     attr = _PerfEventAttr()
-    attr.type = PERF_TYPE_HARDWARE
+    attr.type = type_
     attr.size = _PERF_ATTR_SIZE
     attr.config = config
     flags = _F_EXCLUDE_KERNEL | _F_EXCLUDE_HV
@@ -87,6 +103,17 @@ def _perf_event_open(config: int, pid: int, inherit: bool) -> int:
 
 def _read_counter(fd: int) -> int:
     return struct.unpack("<Q", os.read(fd, 8))[0]
+
+
+def _open_named(name: str, pid: int, inherit: bool) -> int:
+    """Open a counter by name from either the generic HW table or the
+    per-level cache table. Returns fd or -1."""
+    if name in HW_COUNTERS:
+        return _perf_event_open(HW_COUNTERS[name], pid, inherit)
+    if name in HW_CACHE_COUNTERS:
+        return _perf_event_open(HW_CACHE_COUNTERS[name], pid, inherit,
+                                type_=PERF_TYPE_HW_CACHE)
+    return -1
 
 
 def main(
@@ -115,10 +142,10 @@ def main(
 
     fds = {}
     for name in counters:
-        if name not in HW_COUNTERS:
+        if name not in HW_COUNTERS and name not in HW_CACHE_COUNTERS:
             logger.warning(f"unknown CPU counter {name!r}, skipping")
             continue
-        fd = _perf_event_open(HW_COUNTERS[name], pid, inherit=(pid == 0))
+        fd = _open_named(name, pid, inherit=(pid == 0))
         if fd < 0:
             logger.warning(f"perf_event_open failed for {name} (errno={ctypes.get_errno()})")
             continue
@@ -157,7 +184,9 @@ def measure_command(
     program,
     filename: str = "cpu_counters.pkl",
     outdir: str = ".",
-    counters: tuple = ("instructions", "cpu_cycles", "cache_references", "cache_misses"),
+    counters: tuple = ("instructions", "cpu_cycles", "cache_references",
+                       "cache_misses", "l1d_read_access", "l1d_read_miss",
+                       "llc_read_access", "llc_read_miss"),
     cpu_clock: str = "monotonic",
     off: float = 0.02,
 ):
@@ -179,11 +208,11 @@ def measure_command(
 
     fds = {}
     for name in counters:
-        if name not in HW_COUNTERS:
-            continue
-        fd = _perf_event_open(HW_COUNTERS[name], 0, inherit=True)
+        fd = _open_named(name, 0, inherit=True)
         if fd >= 0:
             fds[name] = fd
+        elif name in HW_CACHE_COUNTERS:
+            logger.warning(f"cache event {name} unsupported on this CPU, skipped")
     if not fds:
         logger.warning("no CPU counters opened; check perf_event_paranoid")
         subprocess.run(list(program))
