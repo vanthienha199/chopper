@@ -29,6 +29,50 @@ LOCK = threading.Lock()
 TURN = 0
 
 
+def _assemble_completion(sse_payload: str) -> dict:
+    """Fold an OpenAI SSE stream back into one chat.completion object."""
+    content = ""
+    tool_calls: dict[int, dict] = {}
+    finish = None
+    usage = {}
+    rid, model = "proxy-upgraded", ""
+    for line in sse_payload.splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            ev = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+        rid = ev.get("id", rid)
+        model = ev.get("model", model)
+        if ev.get("usage"):
+            usage = ev["usage"]
+        for ch in ev.get("choices", []):
+            d = ch.get("delta", {})
+            content += d.get("content") or ""
+            for tc in d.get("tool_calls") or []:
+                i = tc.get("index", 0)
+                slot = tool_calls.setdefault(
+                    i, {"id": "", "type": "function",
+                        "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                f = tc.get("function", {})
+                if f.get("name"):
+                    slot["function"]["name"] = f["name"]
+                slot["function"]["arguments"] += f.get("arguments") or ""
+            if ch.get("finish_reason"):
+                finish = ch["finish_reason"]
+    message = {"role": "assistant", "content": content or None}
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    return {"id": rid, "object": "chat.completion",
+            "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": finish or "stop"}],
+            "usage": usage}
+
+
 def _prompt_hash(body: dict) -> str:
     msgs = body.get("messages", body.get("prompt", ""))
     return hashlib.sha256(
@@ -66,6 +110,18 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
         stream = bool(body.get("stream"))
+        # ttft observation for non-streaming harnesses (e.g. mini-swe-agent,
+        # which cannot stream: its model layer reads response.choices[0]
+        # directly): upgrade the UPSTREAM leg to streaming so the first
+        # chunk timestamps queue+prefill, then reassemble a normal
+        # non-streaming response for the harness. Transparent to the client.
+        upgraded = False
+        if (not stream and not ARGS.no_ttft_upgrade
+                and self.path.rstrip("/").endswith("/chat/completions")):
+            body = dict(body, stream=True,
+                        stream_options={"include_usage": True})
+            raw = json.dumps(body).encode()
+            upgraded = True
         t0 = time.time()
 
         req = urllib.request.Request(
@@ -75,7 +131,27 @@ class Handler(BaseHTTPRequestHandler):
         chunks = []
         try:
             with urllib.request.urlopen(req, timeout=600) as r:
-                if stream:
+                if upgraded:
+                    # consume the upstream SSE ourselves, time the first
+                    # chunk, rebuild one chat.completion for the client
+                    first = True
+                    while True:
+                        chunk = r.read(8192)
+                        if not chunk:
+                            break
+                        if first:
+                            ttft = time.time() - t0
+                            first = False
+                        chunks.append(chunk)
+                    resp = _assemble_completion(b"".join(chunks).decode())
+                    data = json.dumps(resp).encode()
+                    chunks = [data]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                elif stream:
                     self.send_response(r.status)
                     self.send_header("Content-Type",
                                      r.headers.get("Content-Type",
@@ -175,6 +251,10 @@ def main():
     p.add_argument("--port", type=int, default=8124)
     p.add_argument("--out", required=True)
     p.add_argument("--task", default=None)
+    p.add_argument("--no-ttft-upgrade", action="store_true",
+                   help="pass non-streaming requests through unchanged "
+                        "instead of upgrading the upstream leg to streaming "
+                        "for first-token timing")
     ARGS = p.parse_args()
     open(ARGS.out, "w").close()
     srv = ThreadingHTTPServer(("127.0.0.1", ARGS.port), Handler)
