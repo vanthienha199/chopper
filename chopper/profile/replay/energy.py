@@ -19,6 +19,17 @@ from typing import Any
 import pandas as pd
 
 
+def _single_gpu_guard(gpu_df):
+    # integrating an interleaved multi-GPU (or multi-node) series gives
+    # meaningless joules; the caller must filter to one device first
+    for col in ("gpu", "node"):
+        if col in gpu_df.columns and gpu_df[col].nunique() > 1:
+            raise ValueError(
+                f"energy_per_turn needs a single-device series but got "
+                f"{gpu_df[col].nunique()} distinct {col!r} values; "
+                f"filter or groupby first")
+
+
 def energy_per_turn(gpu: pd.DataFrame, turns: pd.DataFrame,
                     power_col: str, ts_col: str = "ts") -> pd.DataFrame:
     g = gpu.sort_values(ts_col)

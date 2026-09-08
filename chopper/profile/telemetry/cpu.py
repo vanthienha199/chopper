@@ -77,6 +77,7 @@ def main(
 
     os.makedirs(outdir, exist_ok=True)
     df = pd.DataFrame(results)
+    df["node"] = __import__("socket").gethostname()  # multi-node: rows carry their host
     # Record the clock domain so merge.py can align cpu.pkl to the GPU timeline.
     df.attrs["clock_domain"] = clock_domain
     df.to_pickle(f"{outdir}/{filename}")

@@ -42,6 +42,7 @@ def _main(
                 pause_ts = monotonic_ns() + int(on * 1e9)
 
         df = pd.DataFrame(results)
+    df["node"] = __import__("socket").gethostname()  # multi-node: rows carry their host
         os.makedirs(outdir, exist_ok=True)
         df.to_pickle(f"{outdir}/{filename}")
     except AmdSmiException as e:

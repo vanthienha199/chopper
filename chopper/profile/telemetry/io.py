@@ -80,6 +80,7 @@ def main(
 
     os.makedirs(outdir, exist_ok=True)
     df = pd.DataFrame(results)
+    df["node"] = __import__("socket").gethostname()  # multi-node: rows carry their host
     df.attrs["clock_domain"] = clock_domain
     df.to_pickle(f"{outdir}/{filename}")
     agents_seen = sorted(a for a in df["agent"].unique() if a != "_system") if len(df) else []

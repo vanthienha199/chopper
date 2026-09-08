@@ -3,6 +3,16 @@ from loguru import logger
 from chopper.profile.runner import Runner
 
 
+def _namespace_outdir(outdir):
+    # multi-node SLURM jobs: two nodes writing gpu.pkl into one shared
+    # outdir silently clobber each other, so each node gets its own subdir
+    import os
+    import socket
+    if int(os.environ.get("SLURM_JOB_NUM_NODES", "1")) > 1:
+        return os.path.join(outdir, socket.gethostname())
+    return outdir
+
+
 def main(program,
          counter_names,
          outdir,
@@ -19,6 +29,7 @@ def main(program,
     if len(program) == 0:
         logger.error("Please pass a program to run")
         return -1
+    outdir = _namespace_outdir(outdir)
 
     runner = Runner()
 

@@ -176,6 +176,7 @@ def main(
 
     os.makedirs(outdir, exist_ok=True)
     df = pd.DataFrame(results)
+    df["node"] = __import__("socket").gethostname()  # multi-node: rows carry their host
     df.attrs["clock_domain"] = clock_domain
     df.to_pickle(f"{outdir}/{filename}")
 
@@ -237,6 +238,7 @@ def measure_command(
         os.close(fd)
     os.makedirs(outdir, exist_ok=True)
     df = pd.DataFrame(results)
+    df["node"] = __import__("socket").gethostname()  # multi-node: rows carry their host
     df.attrs["clock_domain"] = clock_domain
     df.to_pickle(f"{outdir}/{filename}")
     logger.info(f"wrote {outdir}/{filename}: {len(df)} samples")
@@ -307,6 +309,7 @@ def attach_pid(
 
     os.makedirs(outdir, exist_ok=True)
     df = pd.DataFrame(list(rows.values()))
+    df["node"] = __import__("socket").gethostname()  # multi-node: rows carry their host
     df.attrs["clock_domain"] = clock_domain
     df.to_pickle(f"{outdir}/{filename}")
     logger.info(f"wrote {outdir}/{filename}: {len(df)} intervals from pid {pid}")
