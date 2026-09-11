@@ -7,6 +7,13 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
 from loguru import logger
 
+from chopper.common.nodes import (
+    NODE_COL,
+    nodes_in,
+    require_node_axis,
+    resolve_node_from_path,
+)
+
 
 def assign_ranges(timestamps, ranges):
     """Assign labels from (start, end, label) ranges to timestamps.
@@ -295,8 +302,59 @@ def get_combined_counters(csv_list):
     return df_combined
 
 
-def merge_counters(df_ts, counter_batches):
+def _assign_counter_nodes(per_device, ts_nodes, counter_nodes):
+    """Work out which node each counter device's CSV files came from.
+
+    Args:
+        per_device: Per-device lists of CSV paths (the transposed batches).
+        ts_nodes: Node labels present in the trace frame.
+        counter_nodes: Explicit override. Either one label for every device or
+            one label per device, in the same order as per_device.
+
+    Returns:
+        List of node labels (or None where the node could not be determined),
+        one per device.
+    """
+    n = len(per_device)
+    if counter_nodes:
+        counter_nodes = [str(x) for x in counter_nodes]
+        if len(counter_nodes) == 1:
+            return counter_nodes * n
+        assert len(counter_nodes) == n, (
+            f"got {len(counter_nodes)} counter nodes for {n} counter devices; "
+            f"pass one label for all devices or one label per device")
+        return counter_nodes
+
+    inferred = [resolve_node_from_path(fns[0], ts_nodes) for fns in per_device]
+    if all(x is None for x in inferred) and len(ts_nodes) == 1:
+        # Single-node run: every counter file belongs to the only node there is.
+        return [ts_nodes[0]] * n
+    return inferred
+
+
+def _gpu_index_within_node(device_nodes):
+    """Number the devices 0..N-1 within each node, in file-sorted order.
+
+    ``sorted()`` groups a node's files together because collect.py writes them
+    under a directory named by the hostname, and within a node the existing
+    convention is that sorted file order is GPU order.
+    """
+    seen: dict = {}
+    out = []
+    for node in device_nodes:
+        idx = seen.get(node, 0)
+        out.append(idx)
+        seen[node] = idx + 1
+    return out
+
+
+def merge_counters(df_ts, counter_batches, counter_nodes=None):
     """Join hardware counter data with trace pickle.
+
+    The join keys on kernel name plus an instance index within one device. On
+    a multi-node run the device is (node, gpu), not gpu alone, because GPU 3
+    exists on every node and reaches the same instance index there. Keying on
+    gpu alone would pick an arbitrary node's row.
 
     Args:
         df_ts: Trace DataFrame (from ts.pkl)
@@ -304,22 +362,62 @@ def merge_counters(df_ts, counter_batches):
             CSV files (sorted = GPU order). E.g.:
             [["batch0/gpu0.csv", "batch0/gpu1.csv"],
              ["batch1/gpu0.csv", "batch1/gpu1.csv"]]
+        counter_nodes: Optional node label per counter device (or one label for
+            all of them). Defaults to inferring the node from each file's path,
+            which works with the per-node output directories collect.py creates.
+
+    Raises:
+        ValueError: When more than one node's data is present but the node of
+            some rows or some counter files cannot be determined.
     """
-    # Transpose from per-batch to per-GPU
+    # Transpose from per-batch to per-device
     per_gpu = [list(fns) for fns in zip(*[sorted(b) for b in counter_batches])]
     n_counter_gpus = len(per_gpu)
 
-    gpus = sorted(df_ts["gpu"].unique())
-    if len(gpus) != n_counter_gpus:
-        logger.warning(f"{len(gpus)} GPUs in trace but {n_counter_gpus} counter files")
+    ts_nodes = nodes_in(df_ts)
+    device_nodes = _assign_counter_nodes(per_gpu, ts_nodes, counter_nodes)
+    known_nodes = sorted(set(ts_nodes) | set(n for n in device_nodes if n is not None))
+    use_node = len(known_nodes) > 1
 
-    # Load and combine counters per GPU
-    df_cntr = pd.concat(
-        [df.assign(gpu=i) for i, df in enumerate(
-            map(get_combined_counters, per_gpu))],
-        ignore_index=True,
-    )
-    logger.info(f"Loaded {len(df_cntr)} counter rows across {n_counter_gpus} GPUs")
+    gpus = sorted(df_ts["gpu"].unique())
+    if use_node:
+        require_node_axis(df_ts, "trace frame", other_nodes=known_nodes)
+        missing = [fns[0] for fns, node in zip(per_gpu, device_nodes) if node is None]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} counter device(s) could not be attributed to a node "
+                f"while {len(known_nodes)} nodes {known_nodes} are present "
+                f"(first: {missing[0]}); pass --counter-nodes, because joining "
+                f"them on kernel name and instance index alone would mix nodes")
+        n_trace_devices = len(df_ts[[NODE_COL, "gpu"]].drop_duplicates())
+    else:
+        n_trace_devices = len(gpus)
+        if n_counter_gpus > n_trace_devices and not known_nodes:
+            raise ValueError(
+                f"{n_counter_gpus} counter devices but only {n_trace_devices} "
+                f"device(s) in the trace, and no {NODE_COL!r} column on either "
+                f"side; this is what a multi-node run looks like to a merge that "
+                f"cannot tell the nodes apart. Re-collect with node stamping or "
+                f"pass --counter-nodes")
+
+    if n_trace_devices != n_counter_gpus:
+        logger.warning(
+            f"{n_trace_devices} devices in trace but {n_counter_gpus} counter files")
+
+    # Load and combine counters per device
+    device_gpus = _gpu_index_within_node(device_nodes) if use_node else list(range(n_counter_gpus))
+    frames = []
+    for i, fns in enumerate(per_gpu):
+        d = get_combined_counters(fns).assign(gpu=device_gpus[i])
+        if use_node:
+            d[NODE_COL] = device_nodes[i]
+        frames.append(d)
+    df_cntr = pd.concat(frames, ignore_index=True)
+    if use_node:
+        logger.info(f"Loaded {len(df_cntr)} counter rows across {n_counter_gpus} "
+                    f"devices on {len(known_nodes)} nodes {known_nodes}")
+    else:
+        logger.info(f"Loaded {len(df_cntr)} counter rows across {n_counter_gpus} GPUs")
 
     kname = "Kernel_Name"
 
@@ -343,9 +441,12 @@ def merge_counters(df_ts, counter_batches):
     # Remove mismatched kernels from counter side
     df_cntr = df_cntr[~df_cntr[kname].isin(cntr_only)]
 
-    # Assign reverse-cumcount _mi (count from end so late dispatches align)
-    left_keys = ["name", "gpu"]
-    right_keys = [kname, "gpu"]
+    # Assign reverse-cumcount _mi (count from end so late dispatches align).
+    # The instance index only means anything within one device, so on a
+    # multi-node run the device key carries the node as well as the GPU.
+    dev_keys = [NODE_COL, "gpu"] if use_node else ["gpu"]
+    left_keys = ["name"] + dev_keys
+    right_keys = [kname] + dev_keys
 
     df_match["_mi"] = (
         df_match.iloc[::-1].groupby(left_keys).cumcount().iloc[::-1]
@@ -407,12 +508,65 @@ def _prepare_device_samples(counter_df):
     return piv, half_dt_ns
 
 
+def scan_rank_files(group_dir):
+    """Discover the per-rank device files in one counter group directory.
+
+    The device tool suffixes its output with the GLOBAL rank (RANK, else
+    SLURM_PROCID, else LOCAL_RANK) and writes a rank_info sidecar naming the
+    node, the global rank and the local rank. The local rank is the index of
+    the GPU on its own node, which is the number that lines up with the trace
+    frame's 'gpu' column.
+
+    Runs collected before the sidecar existed have no node information. There
+    the suffix is treated as both the global and the local rank, which is
+    correct for a single-node run, and the caller's node guard is what has to
+    catch a multi-node one.
+
+    Args:
+        group_dir: One chopper_device_counters* directory.
+
+    Returns:
+        List of dicts sorted by (node, local_rank), each with keys
+        global_rank, local_rank, node, counter_file, trace_file.
+    """
+    from pathlib import Path
+
+    group_dir = Path(group_dir)
+    records = []
+    for cf in sorted(group_dir.glob("counter_samples_rank*.csv")):
+        suffix = cf.stem.split("_rank")[1]
+        tf = group_dir / f"kernel_traces_rank{suffix}.csv"
+        info_path = group_dir / f"rank_info_rank{suffix}.csv"
+        node = None
+        local_rank = int(suffix)
+        global_rank = int(suffix)
+        if info_path.is_file():
+            info = pd.read_csv(info_path)
+            assert len(info) == 1, f"{info_path} should hold exactly one row"
+            row = info.iloc[0]
+            node = str(row["node"])
+            local_rank = int(row["local_rank"])
+            global_rank = int(row["global_rank"])
+        records.append({
+            "global_rank": global_rank,
+            "local_rank": local_rank,
+            "node": node,
+            "counter_file": cf,
+            "trace_file": tf,
+        })
+    records.sort(key=lambda r: (r["node"] or "", r["local_rank"]))
+    return records
+
+
 def merge_device_with_traces(device_dir, trace_pkl, output):
     """Merge device counter samples with PyTorch trace annotations.
 
     Each counter group keeps its own runtime kernel trace and samples.
     Annotations (operator-name, layer, iteration) are stolen from ts.pkl
-    via reverse-cumcount matching.
+    via reverse-cumcount matching, keyed per device. On a multi-node run the
+    device is (node, gpu): the same kernel name reaches the same instance
+    index on every node, so a gpu-only key would steal another host's
+    annotations.
 
     Output: {
         "groups": {gi: {"kernels": df, "samples": df, "counters": [...]}},
@@ -441,31 +595,62 @@ def merge_device_with_traces(device_dir, trace_pkl, output):
     for c in ann_cols:
         assert c in df_last.columns, f"ts.pkl missing required column: {c}"
 
-    # Prepare ts.pkl reverse cumcount per GPU (done once)
-    ts_by_gpu = {}
-    for gpu in gpus:
-        ts_gpu = df_last[df_last["gpu"] == gpu].copy()
-        ts_gpu["_mi"] = (
-            ts_gpu.iloc[::-1].groupby("name").cumcount().iloc[::-1]
+    # Decide once whether the node takes part in the device key.
+    probe = scan_rank_files(group_dirs[0])
+    assert probe, f"No counter_samples_rank*.csv in {group_dirs[0]}"
+    file_nodes = sorted(set(r["node"] for r in probe if r["node"] is not None))
+    ts_nodes = nodes_in(df_last)
+    known_nodes = sorted(set(file_nodes) | set(ts_nodes))
+    use_node = len(known_nodes) > 1
+    if use_node:
+        require_node_axis(df_last, f"trace frame {trace_pkl}", other_nodes=known_nodes)
+        unlabelled = [r for r in probe if r["node"] is None]
+        if unlabelled:
+            raise ValueError(
+                f"{len(unlabelled)} device file(s) in {group_dirs[0]} carry no "
+                f"rank_info sidecar while {len(known_nodes)} nodes {known_nodes} "
+                f"are present; those files cannot be attributed to a host and "
+                f"annotating them by gpu index alone would take another node's rows")
+
+    def device_key(node, gpu):
+        return (node, gpu) if use_node else (gpu,)
+
+    # Prepare ts.pkl reverse cumcount per device (done once)
+    ts_by_device = {}
+    if use_node:
+        device_pairs = [(str(n), g) for n, g in
+                        df_last[[NODE_COL, "gpu"]].drop_duplicates().itertuples(index=False)]
+    else:
+        device_pairs = [(None, g) for g in gpus]
+    for node, gpu in device_pairs:
+        sel = df_last["gpu"] == gpu
+        if use_node:
+            sel = sel & (df_last[NODE_COL].astype(str) == node)
+        ts_dev = df_last[sel].copy()
+        ts_dev["_mi"] = (
+            ts_dev.iloc[::-1].groupby("name").cumcount().iloc[::-1]
         )
-        ts_by_gpu[gpu] = ts_gpu
+        ts_by_device[device_key(node, gpu)] = ts_dev
 
     output_groups = {}
     counter_to_group = {}
 
     for gi, group_dir in enumerate(group_dirs):
-        counter_files = sorted(group_dir.glob("counter_samples_rank*.csv"))
-        trace_files = sorted(group_dir.glob("kernel_traces_rank*.csv"))
-        assert counter_files, f"No counter_samples_rank*.csv in {group_dir}"
-        assert trace_files, f"No kernel_traces_rank*.csv in {group_dir}"
+        rank_records = scan_rank_files(group_dir)
+        assert rank_records, f"No counter_samples_rank*.csv in {group_dir}"
+        found = {device_key(r["node"], r["local_rank"]) for r in rank_records}
+        for key in ts_by_device:
+            assert key in found, f"Missing device files for {key} in {group_dir}"
 
         all_kernels = []
         all_samples = []
         group_counter_names = None
 
-        for gpu in gpus:
-            counter_file = group_dir / f"counter_samples_rank{gpu}.csv"
-            trace_file = group_dir / f"kernel_traces_rank{gpu}.csv"
+        for rec in rank_records:
+            node = rec["node"]
+            gpu = rec["local_rank"]
+            counter_file = rec["counter_file"]
+            trace_file = rec["trace_file"]
             assert counter_file.is_file(), f"Missing {counter_file}"
             assert trace_file.is_file(), f"Missing {trace_file}"
 
@@ -484,8 +669,11 @@ def merge_device_with_traces(device_dir, trace_pkl, output):
             samples_piv = samples_piv.copy()
             samples_piv["timestamp_ns"] = samples_piv["timestamp_ns"] - half_dt_ns
             samples_piv["gpu"] = gpu
+            if use_node:
+                samples_piv[NODE_COL] = node
 
-            logger.info(f"Group {gi}, GPU {gpu}: {len(samples_piv)} samples, "
+            where = f"GPU {gpu}" if not use_node else f"{node} GPU {gpu}"
+            logger.info(f"Group {gi}, {where}: {len(samples_piv)} samples, "
                         f"{len(runtime_df)} runtime kernels")
 
             # Annotate runtime kernels from ts.pkl
@@ -495,15 +683,20 @@ def merge_device_with_traces(device_dir, trace_pkl, output):
                 "duration_ns": "dur",
             }).copy()
             kernel_rows["gpu"] = gpu
+            if use_node:
+                kernel_rows[NODE_COL] = node
 
             # Reverse cumcount match to steal annotations
-            ts_gpu = ts_by_gpu[gpu]
+            key = device_key(node, gpu)
+            assert key in ts_by_device, (
+                f"device {key} has counter files but no rows in {trace_pkl}; "
+                f"trace has {sorted(ts_by_device)}")
+            ts_gpu = ts_by_device[key]
             ts_names = set(ts_gpu["name"])
             rt_names = set(kernel_rows["name"])
-            ts_names & rt_names
             rt_only = rt_names - ts_names
             if rt_only:
-                logger.warning(f"  Group {gi}, GPU {gpu}: {len(rt_only)} kernels not in ts.pkl")
+                logger.warning(f"  Group {gi}, {where}: {len(rt_only)} kernels not in ts.pkl")
 
             kernel_rows["_mi"] = (
                 kernel_rows.iloc[::-1].groupby("name").cumcount().iloc[::-1]
@@ -523,7 +716,9 @@ def merge_device_with_traces(device_dir, trace_pkl, output):
 
         df_kernels = pd.concat(all_kernels, ignore_index=True)
         df_samples = pd.concat(all_samples, ignore_index=True)
-        df_samples = df_samples.sort_values(["gpu", "timestamp_ns"]).reset_index(drop=True)
+        sample_sort = ([NODE_COL, "gpu", "timestamp_ns"] if use_node
+                       else ["gpu", "timestamp_ns"])
+        df_samples = df_samples.sort_values(sample_sort).reset_index(drop=True)
 
         n_annotated = df_kernels["operator-name"].notna().sum()
         logger.info(f"Group {gi}: {len(df_kernels)} kernels ({n_annotated} annotated), "
@@ -546,7 +741,11 @@ def merge_device_with_traces(device_dir, trace_pkl, output):
 
     t1 = time.time()
     logger.info(f"Wrote {output} in {t1 - t0:.2f}s")
-    logger.info(f"  {len(output_groups)} groups, {len(gpus)} GPUs")
+    if use_node:
+        logger.info(f"  {len(output_groups)} groups, {len(ts_by_device)} devices "
+                    f"on {len(known_nodes)} nodes {known_nodes}")
+    else:
+        logger.info(f"  {len(output_groups)} groups, {len(gpus)} GPUs")
     logger.info(f"  Counter -> group: {counter_to_group}")
 
 
@@ -555,6 +754,12 @@ def merge_device_counters(device_dir, output):
 
     Reads counter_samples_rank*.csv and kernel_traces_rank*.csv from
     chopper_device_counters*/ subdirs.
+
+    Dict keys are (group_index, global_rank). The rank in the filename is the
+    GLOBAL rank, so the keys stay unique across nodes. When more than one node
+    contributed, the result carries an extra 'rank_index' frame mapping each
+    global rank to its node and local GPU index, because the global rank on
+    its own does not say which physical GPU produced the rows.
     """
     from pathlib import Path
 
@@ -565,6 +770,7 @@ def merge_device_counters(device_dir, output):
     counter_samples = {}
     kernel_traces = {}
     counter_to_group = {}  # {counter_name: group_index}
+    rank_rows = []
 
     for gi, group_dir in enumerate(groups):
         counter_files = sorted(group_dir.glob("counter_samples_rank*.csv"))
@@ -572,10 +778,22 @@ def merge_device_counters(device_dir, output):
         assert counter_files, f"No counter_samples_rank*.csv in {group_dir}"
         assert trace_files, f"No kernel_traces_rank*.csv in {group_dir}"
 
+        for rec in scan_rank_files(group_dir):
+            rank_rows.append({
+                "group": gi,
+                "global_rank": rec["global_rank"],
+                "local_rank": rec["local_rank"],
+                NODE_COL: rec["node"],
+            })
+
         for cf in counter_files:
             rank = int(cf.stem.split("_rank")[1])
             df = pd.read_csv(cf)
             assert len(df) > 0, f"Empty counter file: {cf}"
+            assert (gi, rank) not in counter_samples, (
+                f"two counter files claim group {gi} rank {rank} ({cf}); the "
+                f"device tool names files by global rank, so this means two "
+                f"nodes wrote into one directory with local ranks")
             counter_samples[(gi, rank)] = df
             for name in df["counter_name"].unique():
                 counter_to_group[name] = gi
@@ -591,6 +809,12 @@ def merge_device_counters(device_dir, output):
         "kernel_traces": kernel_traces,
         "counter_to_group": counter_to_group,
     }
+
+    # Only present on a multi-node run, so a single-node pickle is unchanged.
+    seen_nodes = sorted(set(r[NODE_COL] for r in rank_rows if r[NODE_COL] is not None))
+    if len(seen_nodes) > 1:
+        result["rank_index"] = pd.DataFrame(rank_rows)
+        logger.info(f"  Nodes: {seen_nodes}")
 
     import pickle
     with open(output, "wb") as f:
@@ -649,6 +873,13 @@ def merge_cpu_gpu_timeline(cpu_pkl, kernel_csv, output, bin_ms=10):
     import pickle
 
     cpu = pd.read_pickle(cpu_pkl)
+    cpu_nodes = nodes_in(cpu)
+    if len(cpu_nodes) > 1:
+        raise ValueError(
+            f"{cpu_pkl} holds CPU samples from {len(cpu_nodes)} nodes {cpu_nodes} "
+            f"but {kernel_csv} is one node's kernel trace; binning them onto one "
+            f"axis would average another host's cores against these kernels. "
+            f"Filter the frame to one node, or bin each node separately")
     domain = cpu.attrs.get("clock_domain")
     if domain != "rocprofiler":
         logger.warning(
@@ -694,8 +925,53 @@ def merge_cpu_gpu_timeline(cpu_pkl, kernel_csv, output, bin_ms=10):
                 f"CPU-GPU corr={corr:.2f}")
 
 
+def _trace_node_labels(traces, trace_nodes):
+    """Decide the node label for each trace file, or None for a single-node run.
+
+    Args:
+        traces: Trace file paths, in the order they will be parsed.
+        trace_nodes: What the caller passed for --trace-nodes. Either None,
+            the literal "auto" (use each trace's parent directory name, which
+            is the hostname under the per-node output layout), one label for
+            every trace, or one label per trace.
+
+    Returns:
+        List of labels the same length as traces, or None when the run is
+        single-node and the frame should stay exactly as it was before.
+
+    Raises:
+        ValueError: When the traces come from several directories and the
+            caller did not say which node each belongs to.
+    """
+    from pathlib import Path
+
+    if trace_nodes:
+        labels = [str(x) for x in trace_nodes]
+        if labels == ["auto"]:
+            labels = [Path(t).resolve().parent.name for t in traces]
+        elif len(labels) == 1:
+            labels = labels * len(traces)
+        else:
+            assert len(labels) == len(traces), (
+                f"got {len(labels)} trace nodes for {len(traces)} traces; pass "
+                f"one label for all of them, one per trace, or 'auto'")
+        return labels if len(set(labels)) > 1 else None
+
+    parents = sorted(set(str(Path(t).resolve().parent) for t in traces))
+    if len(parents) > 1:
+        raise ValueError(
+            f"traces come from {len(parents)} directories {parents} and carry "
+            f"no node label; on a multi-node run that means several hosts' "
+            f"GPU 0 would all be numbered gpu=0 and later joins would mix "
+            f"them. Pass --trace-nodes auto to label each trace by its parent "
+            f"directory, an explicit label per trace, or a single label if "
+            f"this really is one node")
+    return None
+
+
 def main(traces, pickles, counters, device_dir, output,
-         cpu_pkl=None, kernel_csv=None, bin_ms=10):
+         cpu_pkl=None, kernel_csv=None, bin_ms=10,
+         counter_nodes=None, trace_nodes=None):
     if cpu_pkl and kernel_csv:
         merge_cpu_gpu_timeline(cpu_pkl, kernel_csv, output, bin_ms)
         return
@@ -718,7 +994,7 @@ def main(traces, pickles, counters, device_dir, output,
     if pickles and counters:
         assert len(pickles) == 1, "pass exactly one pickle with -c"
         df = pd.read_pickle(pickles[0])
-        df = merge_counters(df, counters)
+        df = merge_counters(df, counters, counter_nodes=counter_nodes)
         df.to_pickle(output)
         t1 = time.time()
         logger.info(f"Merged counters into {len(df)} kernels -> {output} in {t1-t0:.2f}s")
@@ -726,21 +1002,45 @@ def main(traces, pickles, counters, device_dir, output,
 
     if pickles:
         dfs = [pd.read_pickle(p) for p in pickles]
+        labelled = [NODE_COL in d.columns for d in dfs]
+        if any(labelled) and not all(labelled):
+            raise ValueError(
+                f"{sum(labelled)} of {len(dfs)} pickles carry a {NODE_COL!r} "
+                f"column; concatenating them would leave the unlabelled rows "
+                f"unattributable, and every later join keys on the node. "
+                f"Re-merge the unlabelled inputs with --trace-nodes")
         df = pd.concat(dfs, ignore_index=True)
         df = df.sort_values('ts').reset_index(drop=True)
         df.to_pickle(output)
         t1 = time.time()
+        nodes = nodes_in(df)
+        if len(nodes) > 1:
+            logger.info(f"  {len(nodes)} nodes: {nodes}")
         logger.info(f"Merged {len(pickles)} pickles, {len(df)} kernels -> {output} in {t1-t0:.2f}s")
         return
+
+    node_labels = _trace_node_labels(traces, trace_nodes)
 
     if len(traces) == 1:
         df = parse_trace(traces[0])
         df['gpu'] = 0
+        if node_labels:
+            df[NODE_COL] = node_labels[0]
     else:
         with ProcessPoolExecutor(max_workers=len(traces)) as ex:
             dfs = list(ex.map(parse_trace, traces))
-        for i, d in enumerate(dfs):
-            d['gpu'] = i
+        if node_labels:
+            # gpu is the index of the GPU on its own node, so it restarts at 0
+            # for each node. The (node, gpu) pair is what identifies a device.
+            per_node: dict = {}
+            for d, node in zip(dfs, node_labels):
+                idx = per_node.get(node, 0)
+                d['gpu'] = idx
+                d[NODE_COL] = node
+                per_node[node] = idx + 1
+        else:
+            for i, d in enumerate(dfs):
+                d['gpu'] = i
         df = pd.concat(dfs, ignore_index=True)
 
     df = df.sort_values('ts').reset_index(drop=True)
@@ -748,6 +1048,12 @@ def main(traces, pickles, counters, device_dir, output,
     t1 = time.time()
 
     logger.info(f"Wrote {len(df)} kernels to {output} in {t1-t0:.2f}s")
+    if node_labels:
+        logger.info(f"Nodes: {nodes_in(df)}")
+        logger.warning(
+            "kernel timestamps from different nodes are in different clock "
+            "domains; convert them with chopper.profile.telemetry.clock_anchor "
+            "before comparing across nodes")
     logger.info(f"Columns: {list(df.columns)}")
 
 
@@ -775,6 +1081,16 @@ if __name__ == '__main__':
                         help='Device sampler kernel_traces.csv for CPU+GPU timeline')
     parser.add_argument('--bin-ms', type=int, default=10,
                         help='Time bin size for CPU+GPU timeline (default 10ms)')
+    parser.add_argument('--counter-nodes', nargs='+',
+                        help='Node (hostname) each counter device belongs to, in '
+                             'sorted-file order. Pass one label for all devices or '
+                             'one per device. Defaults to reading the node from the '
+                             'per-node output directory in each file path.')
+    parser.add_argument('--trace-nodes', nargs='+',
+                        help="Node each trace file belongs to. Pass 'auto' to use "
+                             "each trace's parent directory name, one label for all "
+                             "traces, or one label per trace. Required when the "
+                             "traces come from more than one directory.")
     parser.add_argument('-o', '--output', required=True)
     args = parser.parse_args()
     main(sorted(args.traces) if args.traces else None,
@@ -784,4 +1100,6 @@ if __name__ == '__main__':
          args.output,
          args.cpu_pkl,
          args.kernel_csv,
-         args.bin_ms)
+         args.bin_ms,
+         args.counter_nodes,
+         args.trace_nodes)

@@ -10,6 +10,7 @@ from chopper.common.annotations import (
     fix_names as do_fix_names,
 )
 from chopper.common.cache import load_pickle
+from chopper.common.nodes import NODE_COL, device_keys, is_multi_node
 
 
 def select_iters(df: pd.DataFrame, iters: List) -> pd.DataFrame:
@@ -121,24 +122,64 @@ def get_straggler_df(
     iter_idxs: Optional[List] = None,
     agg_meth: str = 'max',
     kernel_name: bool = False,
+    scope: str = 'auto',
 ) -> pd.DataFrame:
     """Load and compute straggler metrics from trace data.
 
     Processes trace data to identify performance stragglers by computing
     how much each GPU lags behind the slowest GPU for each operation.
 
+    Straggler scope under multi-node:
+        The reference timestamp is a max (or min, or mean) taken across
+        devices. Whether that max should run across all nodes or within each
+        node is a real choice, not a detail, so it is a parameter rather than
+        an accident of which columns happen to be present.
+
+        'global' compares every device in the job against one reference. That
+        is the right question for a single data-parallel group whose devices
+        all synchronise together, and it REQUIRES that the timestamps were
+        already converted to a common timeline, because each node's kernel
+        trace clock has its own origin. Comparing raw per-node timestamps
+        globally produces an s-value dominated by the clock offset, which can
+        be seconds, not the microseconds straggling actually costs.
+
+        'per_node' takes the reference within each node, so the result answers
+        "which GPU lags inside its own host" and needs no clock conversion.
+
+        'auto' (the default) picks 'per_node' when the frame names more than
+        one node and 'global' otherwise, so a single-node run behaves exactly
+        as it did before and a multi-node run defaults to the answer that is
+        correct on unconverted timestamps.
+
     Args:
         fn: Path to trace pickle file
         iter_idxs: Optional list of iteration indices to select
         agg_meth: Aggregation method ('max', 'min', 'mean') for straggler reference
         kernel_name: If True, include kernel names in grouping
+        scope: 'auto', 'per_node', or 'global'. See above.
 
     Returns:
         DataFrame with straggler metrics including 's-value' (lag time) and
-        's-delta' (change in lag between operations)
+        's-delta' (change in lag between operations). On a multi-node frame the
+        result carries a 'straggler-scope' column recording which comparison
+        produced the numbers.
     """
+    assert scope in ('auto', 'per_node', 'global'), f"bad scope: {scope!r}"
+
     group_arr = ['iteration', 'layer', 'operator-name',
                  'name'] if kernel_name else ['iteration', 'layer', 'operator-name']
+
+    probe = load_pickle(fn)
+    multi_node = is_multi_node(probe)
+    dev_keys = [NODE_COL, 'gpu'] if multi_node else ['gpu']
+    if scope == 'auto':
+        scope = 'per_node' if multi_node else 'global'
+    assert not (scope == 'per_node' and not multi_node), (
+        "scope='per_node' needs a frame with a 'node' column; this trace has none")
+
+    # The reference is taken across devices; per_node keeps the node fixed.
+    ref_arr = ([NODE_COL] + group_arr) if scope == 'per_node' else group_arr
+
     df = get_df(
         fn,
         iter_idxs=iter_idxs,
@@ -146,7 +187,7 @@ def get_straggler_df(
         remove_nan_chunks=True,
         remove_overlap=True,
         fix_names=True,
-        group_arr=['gpu'] + group_arr,
+        group_arr=dev_keys + group_arr,
         group_map={
             'ts': ['first', 'last'],
             'dur': ['sum', 'last'],
@@ -154,7 +195,7 @@ def get_straggler_df(
         sort_value='ts_first',
     )
     agg_df = df.groupby(
-        group_arr,
+        ref_arr,
         dropna=False
     ).agg(
         **{f'ts_first_{agg_meth}': ('ts_first', agg_meth)}
@@ -162,7 +203,7 @@ def get_straggler_df(
 
     df = df.merge(
         agg_df,
-        on=group_arr,
+        on=ref_arr,
         how='left'
     )
 
@@ -170,19 +211,22 @@ def get_straggler_df(
         df[f'ts_first_{agg_meth}'] - df['ts_first'])
 
     df['s-delta'] = df.groupby(
-        'gpu'
+        dev_keys
     )['s-value'].transform(lambda x: x.shift(-1) - x)
 
     last_op_of_iter_mask = df.groupby(
-        ['gpu', 'iteration']).cumcount(ascending=False) == 0
+        dev_keys + ['iteration']).cumcount(ascending=False) == 0
     df.loc[last_op_of_iter_mask, 's-delta'] = 0
+
+    if multi_node:
+        df['straggler-scope'] = scope
 
     return df
 
 
 def get_straggler_contributors(
     df: pd.DataFrame,
-    group_arr: List[str] = ['gpu', 'operator-name'],
+    group_arr: Optional[List[str]] = None,
     delta: bool = False,
     agg_cols: List[str] = ['min', 'max', 'median', 'sum'],
 ):
@@ -190,13 +234,18 @@ def get_straggler_contributors(
 
     Args:
         df: DataFrame from get_straggler_df() containing straggler metrics
-        group_arr: List of columns to group by (e.g., ['gpu'], ['operator-name'])
+        group_arr: List of columns to group by (e.g., ['gpu'], ['operator-name']).
+            Defaults to ['gpu', 'operator-name'] on a single-node frame and
+            ['node', 'gpu', 'operator-name'] on a multi-node one, because
+            grouping by gpu alone would pool every node's GPU 3 into one row.
         delta: If True, analyze s-delta instead of s-value
         agg_cols: List of aggregation functions to apply
 
     Returns:
         DataFrame with aggregated straggler contributions
     """
+    if group_arr is None:
+        group_arr = device_keys(df) + ['operator-name']
     return df.groupby(group_arr)[
         's-delta' if delta else 's-value'
     ].agg(list(agg_cols)).reset_index()
@@ -222,6 +271,10 @@ def get_overlap_df(
     Returns:
         If include_comm_df is False: DataFrame with overlap_ratio column
         If include_comm_df is True: Tuple of (overlap_df, comm_df)
+
+    Overlap is computed within one device. On a multi-node frame the device is
+    (node, gpu), so a compute kernel is never matched against communication
+    from another host's GPU of the same index.
     """
     comm_df = get_df(
         fn,
@@ -231,6 +284,10 @@ def get_overlap_df(
     comm_df = comm_df[~no_overlap_mask(comm_df)]
     comm_df['end_ts'] = comm_df['ts'] + comm_df['dur']
 
+    dev_keys = device_keys(comm_df)
+    tail = ['iteration', 'layer', 'operator-name',
+            'name'] if kernel_name else ['iteration', 'layer', 'operator-name']
+
     comp_df = get_df(
         fn,
         iter_idxs=iter_idxs,
@@ -238,8 +295,7 @@ def get_overlap_df(
         remove_nan_chunks=True,
         remove_overlap=True,
         fix_names=True,
-        group_arr=['gpu', 'iteration', 'layer', 'operator-name',
-                   'name'] if kernel_name else ['gpu', 'iteration', 'layer', 'operator-name'],
+        group_arr=dev_keys + tail,
         group_map={
             'ts': ['first', 'last'],
             'dur': ['sum', 'last'],
@@ -250,8 +306,10 @@ def get_overlap_df(
     comp_df['elapsed'] = comp_df['end_ts'] - comp_df['ts_first']
 
     def add_overlap(group):
-        gpu = group.name
-        gpu_comm_df = comm_df[comm_df['gpu'] == gpu]
+        key = group.name
+        gpu_comm_df = comm_df
+        for col, val in zip(dev_keys, key if isinstance(key, tuple) else (key,)):
+            gpu_comm_df = gpu_comm_df[gpu_comm_df[col] == val]
 
         for op_idx, operation in group.iterrows():
             start = operation['ts_first']
@@ -274,7 +332,9 @@ def get_overlap_df(
             group.loc[op_idx, "overlap_ratio"] = ratio
         return group
 
-    ovr_df = comp_df.groupby('gpu').apply(add_overlap).reset_index(level=0)
+    by = dev_keys[0] if len(dev_keys) == 1 else dev_keys
+    ovr_df = comp_df.groupby(by).apply(add_overlap).reset_index(
+        level=list(range(len(dev_keys))))
     if include_comm_df:
         return ovr_df, comm_df
     else:
@@ -286,6 +346,7 @@ def get_slack_adv_df(
     iter_idxs: Optional[List] = None,
     kernel_name: bool = False,
     agg_meth: str = 'max',
+    scope: str = 'auto',
 ):
     """Compute slack advantage metrics for communication operations.
 
@@ -297,16 +358,31 @@ def get_slack_adv_df(
         iter_idxs: Optional list of iteration indices to select
         kernel_name: If True, include kernel names in grouping
         agg_meth: Aggregation method ('max', 'min', 'mean') for slack reference
+        scope: 'auto', 'per_node', or 'global'. Same meaning as in
+            get_straggler_df: the reference timestamp is taken across devices,
+            and 'global' only makes sense once the timestamps sit on a common
+            timeline.
 
     Returns:
         Tuple of (comm_df, comp_df) with timing and straggler information
     """
+    assert scope in ('auto', 'per_node', 'global'), f"bad scope: {scope!r}"
+
     group_arr = ['iteration', 'layer', 'operator-name',
                  'name'] if kernel_name else ['iteration', 'layer', 'operator-name']
+
+    multi_node = is_multi_node(load_pickle(fn))
+    dev_keys = [NODE_COL, 'gpu'] if multi_node else ['gpu']
+    if scope == 'auto':
+        scope = 'per_node' if multi_node else 'global'
+    assert not (scope == 'per_node' and not multi_node), (
+        "scope='per_node' needs a frame with a 'node' column; this trace has none")
+    ref_arr = ([NODE_COL] + group_arr) if scope == 'per_node' else group_arr
+
     comm_df = get_df(
         fn,
         iter_idxs=iter_idxs,
-        group_arr=['gpu'] + group_arr,
+        group_arr=dev_keys + group_arr,
         group_map={
             'ts': ['first', 'last'],
             'dur': ['sum', 'last'],
@@ -325,7 +401,7 @@ def get_slack_adv_df(
         remove_nan_chunks=True,
         remove_overlap=True,
         fix_names=True,
-        group_arr=['gpu'] + group_arr,
+        group_arr=dev_keys + group_arr,
         group_map={
             'ts': ['first', 'last'],
             'dur': ['sum', 'last'],
@@ -336,7 +412,7 @@ def get_slack_adv_df(
     comp_df['elapsed'] = comp_df['end_ts'] - comp_df['ts_first']
 
     agg_df = comm_df.groupby(
-        group_arr,
+        ref_arr,
         dropna=False
     ).agg(
         **{f'ts_{agg_meth}': ('ts_first', agg_meth)}
@@ -344,11 +420,14 @@ def get_slack_adv_df(
 
     comm_df = comm_df.merge(
         agg_df,
-        on=group_arr,
+        on=ref_arr,
         how='left'
     )
 
     comm_df['s-value'] = (
         comm_df[f'ts_{agg_meth}'] - comm_df['ts_first'])
+
+    if multi_node:
+        comm_df['straggler-scope'] = scope
 
     return comm_df, comp_df

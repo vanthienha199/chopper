@@ -25,12 +25,22 @@
 //   CHOPPER_COUNTER_OUTPUT - counter CSV path (default: counter_samples.csv)
 //   CHOPPER_TRACE_OUTPUT   - trace CSV path (default: kernel_traces.csv)
 //   CHOPPER_TRACE_ONLY     - if set, collect dispatch traces only (no device counters)
+//
+// Rank semantics (multi-node):
+//   LOCAL_RANK  - selects which GPU on THIS node to profile. Repeats on every
+//                 node, so it must never appear in an output filename.
+//   RANK        - global rank across the job (torchrun). Used for the output
+//                 filename suffix so two nodes cannot clobber each other.
+//   SLURM_PROCID- fallback global rank when torchrun is not in use.
+// Each process also writes rank_info_rank<GLOBAL>.csv naming its node, global
+// rank and local rank, so the reader can map a file back to a physical GPU.
 
 #include <rocprofiler-sdk/registration.h>
 #include <rocprofiler-sdk/rocprofiler.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cxxabi.h>
 #include <fstream>
@@ -42,6 +52,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <unistd.h>  // gethostname, for the rank_info sidecar
 
 #define ROCPROFILER_CALL(result, msg)                                                    \
     {                                                                                    \
@@ -459,6 +471,10 @@ int tool_init(rocprofiler_client_finalize_t, void*)
                              const_cast<void*>(static_cast<const void*>(&agents))),
                          "query available agents");
 
+        // LOCAL_RANK is the right variable HERE: it indexes the GPUs visible
+        // on this node, which is exactly what the agent list enumerates. It
+        // is the wrong variable for output filenames (see rank_suffix below),
+        // because it restarts at 0 on every node of a multi-node job.
         int target_gpu_index = 0;
         if(auto* lr = std::getenv("LOCAL_RANK"); lr)
             target_gpu_index = std::atoi(lr);
@@ -584,10 +600,56 @@ void tool_fini(void*)
         ROCPROFILER_CALL(rocprofiler_flush_buffer(g_counter_buffer), "counter buffer flush");
     }
 
-    // Determine rank suffix for multi-process runs (torchrun sets LOCAL_RANK)
+    // Determine the rank suffix for multi-process runs.
+    //
+    // LOCAL_RANK restarts at 0 on every node, so two nodes writing into one
+    // directory both produce counter_samples_rank0.csv and the second one
+    // wins. The suffix therefore uses the GLOBAL rank (torchrun sets RANK,
+    // srun sets SLURM_PROCID), which is unique across the whole job. On a
+    // single-node run RANK equals LOCAL_RANK, so the filenames are the same
+    // as before and old outputs stay readable.
+    const char* global_rank_env = std::getenv("RANK");
+    const char* global_rank_src = "RANK";
+    if(!global_rank_env)
+    {
+        global_rank_env = std::getenv("SLURM_PROCID");
+        global_rank_src = "SLURM_PROCID";
+    }
+    const char* local_rank_env = std::getenv("LOCAL_RANK");
+    if(!global_rank_env)
+    {
+        global_rank_env = local_rank_env;
+        global_rank_src = "LOCAL_RANK";
+    }
+
     std::string rank_suffix;
-    if(auto* lr = std::getenv("LOCAL_RANK"); lr)
-        rank_suffix = std::string("_rank") + lr;
+    if(global_rank_env)
+        rank_suffix = std::string("_rank") + global_rank_env;
+
+    // Sidecar that says what the suffix means, so merge.py can map a global
+    // rank back to (node, local GPU index) instead of assuming rank == GPU.
+    if(global_rank_env)
+    {
+        char hostname[256] = {0};
+        if(gethostname(hostname, sizeof(hostname) - 1) != 0)
+            std::snprintf(hostname, sizeof(hostname), "unknown");
+
+        std::string info_path = "rank_info" + rank_suffix + ".csv";
+        if(auto* env = std::getenv("CHOPPER_COUNTER_OUTPUT"); env)
+        {
+            std::string base = env;
+            auto slash = base.rfind('/');
+            std::string dir = (slash == std::string::npos) ? std::string(".")
+                                                            : base.substr(0, slash);
+            info_path = dir + "/rank_info" + rank_suffix + ".csv";
+        }
+        std::ofstream info(info_path);
+        info << "node,global_rank,local_rank,global_rank_source\n";
+        info << hostname << "," << global_rank_env << ","
+             << (local_rank_env ? local_rank_env : global_rank_env) << ","
+             << global_rank_src << "\n";
+        std::clog << "[tool] Wrote rank info to " << info_path << "\n";
+    }
 
     // Write kernel traces CSV
     {

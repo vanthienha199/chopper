@@ -51,7 +51,14 @@ def main():
                         help="Total AllGather size in MB")
     args = parser.parse_args()
 
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    # local_rank picks the GPU on this node and restarts at 0 on every node.
+    # global_rank is unique across the job and is what "rank 0 prints" means.
+    # Using the global rank to select a device breaks on the second node of a
+    # multi-node job, where it exceeds the local device count.
+    local_rank = int(os.environ.get("LOCAL_RANK",
+                                    os.environ.get("SLURM_LOCALID", 0)))
+    global_rank = int(os.environ.get("RANK",
+                                     os.environ.get("SLURM_PROCID", local_rank)))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     if args.mode in ("comm", "both") and world_size == 1:
@@ -62,7 +69,7 @@ def main():
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl")
 
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(local_rank)
 
     # Create streams
     compute_stream = torch.cuda.Stream()
@@ -112,7 +119,7 @@ def main():
 
         time.sleep(args.sleep_ms / 1000.0)
 
-    if rank == 0:
+    if global_rank == 0:
         print(f"Completed {args.iters} iterations in '{args.mode}' mode")
 
     if world_size > 1:

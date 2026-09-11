@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 from loguru import logger
 from chopper.profile.runner import Runner
+from chopper.profile.telemetry import clock_anchor
 
 
 def _namespace_outdir(outdir):
@@ -89,8 +90,14 @@ def main(program,
             container,
             nvidia,
         )
+    # Bracket the collection window with a clock anchor pair. Every collector
+    # stamps its own native clock, so these two readings are what lets a
+    # reader put this node's samples on the shared epoch timeline later, and
+    # what makes the node's clock drift over the run a measured number.
+    clock_anchor.write_anchor(outdir, clock_anchor.TAKEN_START)
     runner.start()
     runner.join()
+    clock_anchor.write_anchor(outdir, clock_anchor.TAKEN_STOP)
 
 
 if __name__ == "__main__":
