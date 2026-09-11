@@ -6,13 +6,18 @@ each produced by the layer that already sees that data.
 
 ## 1. model_calls.jsonl  (produced by the proxy)
 
-One line per model call, in call order (proxy schema_version 8):
+One line per model call, in call order (proxy schema_version 9):
 
     {
-      "turn": 3,
+      "seq": 3,                            // global arrival order, all sessions
+      "turn": 3,                           // alias of seq, kept for old readers
+      "session_id": "sess-2",              // see "Sessions" below
+      "turn_in_session": 2,                // 1-based, per session
+      "inflight_at_arrival": 3,            // requests already in flight
       "ts_epoch_s": 1754321000.123,        // when the request arrived
       "ttft_s": 0.42,                      // first token latency observed
-      "duration_s": 3.10,                  // full response duration
+      "duration_s": 3.10,                  // request send to response end,
+                                           //   INCLUDES ttft_s
       "prompt_tokens": 8123,
       "completion_tokens": 350,
       "prompt_sha256": "ab12...",          // hash of messages, for divergence check
@@ -28,8 +33,26 @@ One line per model call, in call order (proxy schema_version 8):
       "model": "gpt-oss-120b"
     }
 
+### Sessions (schema 9, multi-request)
+
+Several agent sessions can share one backend and one proxy. A single global
+turn counter would interleave their turns, so turns are numbered per
+session. The session key is the `X-Chopper-Session` request header when the
+harness sets one, otherwise the SHA-256 of the first message of the request
+plus the Anthropic `system` field. The header is the preferred path and it
+is required when several concurrent sessions replay the same task, because
+the hash fallback collides on an identical first message. `seq` keeps the
+global arrival order for ordering and joins. Schema 8 records have no
+session fields; readers should treat them as one session.
+
+`duration_s` from the proxy spans request send to response end and already
+contains `ttft_s`. The mock endpoint's own replay journal uses the opposite,
+disjoint convention (sleep `ttft_s`, then pace the body over `duration_s`).
+decompose.py reads the mock journal, multi_request.py reads the proxy
+recording; each applies the convention of its input.
+
 The mocked endpoint (chopper.profile.replay.mock_endpoint) serves exactly
-this file back, FIFO, with the recorded timing. Most agent turns carry
+this file back, FIFO within a session, with the recorded timing. Most agent turns carry
 empty text plus tool_calls (claude-code/codex especially); the mock returns
 them structured, in the protocol of the endpoint being asked:
 POST /v1/chat/completions -> OpenAI shape, POST /v1/messages -> Anthropic
