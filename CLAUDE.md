@@ -18,6 +18,12 @@ pip install .
 # Basic profiling with GPU and CPU telemetry
 python -m chopper.profile.collect --gpu-telemetry --cpu-telemetry -- <workload args>
 
+# Per-agent CPU attribution and per-agent storage I/O. Both find their subjects
+# by looking for processes tagged with CHOPPER_AGENT_ID, so tag the agent or the
+# output will be empty. The collector warns when the tag is missing.
+CHOPPER_AGENT_ID=my-agent python -m chopper.profile.collect \
+    --cpu-telemetry --agent-telemetry --io-telemetry -- <workload args>
+
 # With hardware counters (slower)
 python -m chopper.profile.collect --gpu-telemetry --cpu-telemetry --counters COUNTER1 COUNTER2 -- <workload args>
 

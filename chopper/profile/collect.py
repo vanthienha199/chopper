@@ -26,7 +26,9 @@ def main(program,
          telemetry_off=0.1,
          sample_ms=1,
          cpu_clock="monotonic",
-         vendor="auto"):
+         vendor="auto",
+         agent_telemetry=False,
+         io_telemetry=False):
     if len(program) == 0:
         logger.error("Please pass a program to run")
         return -1
@@ -60,6 +62,43 @@ def main(program,
             nvidia=(vend is Vendor.NVIDIA),
             outdir=outdir,
             on=telemetry_on,
+            off=telemetry_off,
+        )
+
+    # Per-agent CPU and per-agent I/O were reachable only by launching their
+    # modules by hand, so a run started through this entry point produced no
+    # per-agent attribution at all even though that is one of the things the
+    # tool is for. Both are collectors with the same contract as the rest, so
+    # they belong here behind their own flags.
+    if agent_telemetry or io_telemetry:
+        # Both collectors find their subjects by looking for processes tagged
+        # with CHOPPER_AGENT_ID. With nothing tagged they run happily and write
+        # an empty file, which reads as a broken feature rather than as a
+        # missing tag, so say it out loud before the run instead.
+        import os
+        if not os.environ.get("CHOPPER_AGENT_ID"):
+            logger.warning(
+                "per-agent telemetry is on but CHOPPER_AGENT_ID is not set, so "
+                "no process will be attributed and the output will be empty. "
+                "Set it on the agent you want attributed, for example "
+                "CHOPPER_AGENT_ID=my-agent <your command>."
+            )
+    if agent_telemetry:
+        from chopper.profile.telemetry import agents
+        runner.add(
+            agents.main,
+            False,
+            outdir=outdir,
+            cpu_clock=cpu_clock,
+            off=telemetry_off,
+        )
+    if io_telemetry:
+        from chopper.profile.telemetry import io as io_mod
+        runner.add(
+            io_mod.main,
+            False,
+            outdir=outdir,
+            cpu_clock=cpu_clock,
             off=telemetry_off,
         )
 
@@ -180,6 +219,18 @@ if __name__ == "__main__":
         help='sleep duration (seconds) between samples (default: 0.1 = 10 Hz)',
     )
     parser.add_argument(
+        '--agent-telemetry',
+        action='store_true',
+        required=False,
+        help='collect per-agent CPU attribution by process tree'
+    )
+    parser.add_argument(
+        '--io-telemetry',
+        action='store_true',
+        required=False,
+        help='collect per-agent storage I/O'
+    )
+    parser.add_argument(
         'program',
         nargs='*',
         help='program to run',
@@ -199,4 +250,6 @@ if __name__ == "__main__":
         args.sample_ms,
         args.cpu_clock,
         args.vendor,
+        args.agent_telemetry,
+        args.io_telemetry,
     ))
