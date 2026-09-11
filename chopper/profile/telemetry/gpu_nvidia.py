@@ -14,6 +14,7 @@ is False without it or the driver, so callers can skip cleanly off NVIDIA.
 """
 
 import os
+import socket
 from time import monotonic_ns, sleep
 
 import pandas as pd
@@ -98,7 +99,7 @@ def main(
 
         os.makedirs(outdir, exist_ok=True)
         df = pd.DataFrame(results)
-    df["node"] = __import__("socket").gethostname()  # multi-node: rows carry their host
+        df["node"] = socket.gethostname()  # multi-node: rows carry their host
         df.attrs["vendor"] = "nvidia"
         df.to_pickle(f"{outdir}/{filename}")
     finally:
