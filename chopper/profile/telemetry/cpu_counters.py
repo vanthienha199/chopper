@@ -244,7 +244,7 @@ def measure_command(
     outdir: str = ".",
     counters: tuple = ("instructions", "cpu_cycles", "cache_references",
                        "cache_misses", "l1d_read_access", "l1d_read_miss",
-                       "llc_read_access", "llc_read_miss"),
+                       "llc_read_access", "llc_read_miss", "task_clock_ns"),
     cpu_clock: str = "monotonic",
     off: float = 0.02,
 ):
@@ -390,6 +390,15 @@ if __name__ == "__main__":
     parser.add_argument("--filename", default="cpu_counters.pkl")
     parser.add_argument("--cpu-clock", choices=["monotonic", "rocprofiler"], default="monotonic")
     parser.add_argument("--off", type=float, default=0.02, help="sample interval seconds")
+    parser.add_argument(
+        "--counters", nargs="+", default=None,
+        help="counter names to open. Defaults to instructions, cpu_cycles, "
+             "cache_references, cache_misses and task_clock_ns. task_clock_ns "
+             "is in the default set because it measures host busy time "
+             "directly, and without it busy time can only be inferred from "
+             "cycles over an assumed core frequency, which leaves a bracket "
+             "rather than a number. Names come from HW_COUNTERS, "
+             "HW_CACHE_COUNTERS and SW_COUNTERS in this module.")
     parser.add_argument("--attach", type=int, metavar="PID",
                         help="attach to an already-running process instead of launching one")
     parser.add_argument("--interval-ms", type=int, default=200, help="perf interval for --attach")
@@ -401,5 +410,7 @@ if __name__ == "__main__":
                    cpu_clock=args.cpu_clock, interval_ms=args.interval_ms,
                    duration_s=args.duration)
     else:
-        measure_command(args.program, args.filename, args.output_dir,
-                        cpu_clock=args.cpu_clock, off=args.off)
+        kw = {"cpu_clock": args.cpu_clock, "off": args.off}
+        if args.counters:
+            kw["counters"] = tuple(args.counters)
+        measure_command(args.program, args.filename, args.output_dir, **kw)

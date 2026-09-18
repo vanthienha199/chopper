@@ -28,7 +28,9 @@ def main(program,
          cpu_clock="monotonic",
          vendor="auto",
          agent_telemetry=False,
-         io_telemetry=False):
+         io_telemetry=False,
+         cpu_counters=False,
+         cpu_counter_names=None):
     if len(program) == 0:
         logger.error("Please pass a program to run")
         return -1
@@ -83,6 +85,36 @@ def main(program,
                 "Set it on the agent you want attributed, for example "
                 "CHOPPER_AGENT_ID=my-agent <your command>."
             )
+    if cpu_counters:
+        # CPU hardware counters are deliberately NOT registered here, and the
+        # flag exists to say so rather than to let a run quietly produce
+        # nothing.
+        #
+        # A perf_event_open counter is opened against a pid. A background
+        # collector only knows its own pid, and this entry point resolves its
+        # collectors before the workload is launched, so there is no target to
+        # attach to at the moment the counter would be created. Opening against
+        # pid 0 measures the sampler sitting in its own sleep loop: on an EPYC
+        # node that gives 0.00 seconds of task_clock and 0 instructions over a
+        # 12 second workload, a file full of zeros that reads as a broken
+        # feature rather than as a misuse.
+        #
+        # The wrapper form does not have this problem, because the workload is
+        # a child of the counter process, and that is the form the replay jobs
+        # already use and the form every CPU-side number in the reports came
+        # from. Doing this properly from here needs the collector to discover
+        # its target after the workload starts, which is a change to
+        # cpu_counters.py rather than to this file.
+        logger.error(
+            "--cpu-counters is not supported from this entry point. A counter "
+            "is opened against a pid, and the workload does not exist yet when "
+            "collectors are registered here, so the counters would measure the "
+            "sampler and write zeros. Use the wrapper form instead, which is "
+            "what the replay jobs use: python -m "
+            "chopper.profile.telemetry.cpu_counters --output-dir DIR -- "
+            "<your command>. No CPU counter file was written."
+        )
+
     if agent_telemetry:
         from chopper.profile.telemetry import agents
         runner.add(
@@ -231,6 +263,20 @@ if __name__ == "__main__":
         help='collect per-agent storage I/O'
     )
     parser.add_argument(
+        '--cpu-counters',
+        action='store_true',
+        required=False,
+        help='NOT supported here, see the error it prints; use the wrapper '
+             'form python -m chopper.profile.telemetry.cpu_counters instead'
+    )
+    parser.add_argument(
+        '--cpu-counter-names',
+        nargs='+',
+        required=False,
+        help='override the CPU counter set, names from HW_COUNTERS, '
+             'HW_CACHE_COUNTERS or SW_COUNTERS in cpu_counters.py'
+    )
+    parser.add_argument(
         'program',
         nargs='*',
         help='program to run',
@@ -252,4 +298,6 @@ if __name__ == "__main__":
         args.vendor,
         args.agent_telemetry,
         args.io_telemetry,
+        args.cpu_counters,
+        args.cpu_counter_names,
     ))
