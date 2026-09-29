@@ -113,6 +113,82 @@ struct kernel_record_t
 std::vector<kernel_record_t> g_kernel_records;
 std::mutex                   g_kernel_records_mutex;
 
+// Trace CSV path and whether its header has been written. Records are
+// appended to disk periodically (CHOPPER_TRACE_FLUSH_MS, default 5000) and
+// once more at finalization, so a server that is force-killed (vLLM's
+// APIServer SIGKILLs its EngineCore on shutdown) still leaves its trace on
+// disk. Only the tail since the last flush can be lost.
+std::string g_trace_path;
+bool        g_trace_header_written = false;
+size_t      g_trace_records_written = 0;
+
+static std::string
+resolve_trace_path(const std::string& rank_suffix)
+{
+    // CHOPPER_TRACE_PER_PID: one file per process, named the way the
+    // CUPTI tracer names its output (<stem>.<pid>.csv) so the same
+    // reader merges the siblings. A serving engine that forks a worker
+    // (vLLM's APIServer + EngineCore) loads this tool in both processes;
+    // with one shared name the last process to exit truncates the
+    // other's file, and an idle parent that dispatched nothing leaves an
+    // empty CSV where the real trace was. In this mode a process with no
+    // records writes nothing at all.
+    const bool  per_pid = std::getenv("CHOPPER_TRACE_PER_PID") != nullptr;
+    std::string suffix  = per_pid ? ("." + std::to_string(getpid())) : rank_suffix;
+    std::string path    = "kernel_traces" + suffix + ".csv";
+    if(auto* env = std::getenv("CHOPPER_TRACE_OUTPUT"); env)
+    {
+        path = env;
+        if(!suffix.empty())
+        {
+            auto dot = path.rfind('.');
+            if(dot != std::string::npos)
+                path = path.substr(0, dot) + suffix + path.substr(dot);
+            else
+                path += suffix;
+        }
+    }
+    return path;
+}
+
+// Append everything collected since the last call to the trace CSV.
+// Caller must NOT hold g_kernel_records_mutex.
+static void
+flush_trace_records_to_disk()
+{
+    if(g_trace_path.empty()) return;
+    std::vector<kernel_record_t> batch;
+    {
+        std::lock_guard<std::mutex> lk(g_kernel_records_mutex);
+        if(g_kernel_records.empty()) return;
+        batch.swap(g_kernel_records);
+    }
+    std::ofstream out(g_trace_path, g_trace_header_written ? std::ios::app : std::ios::trunc);
+    if(!out)
+    {
+        std::clog << "[tool] cannot open " << g_trace_path << " for writing\n";
+        std::lock_guard<std::mutex> lk(g_kernel_records_mutex);
+        g_kernel_records.insert(g_kernel_records.begin(), batch.begin(), batch.end());
+        return;
+    }
+    if(!g_trace_header_written)
+    {
+        out << "kernel_name,start_ns,end_ns,duration_ns,agent_id,queue_id,correlation_id\n";
+        g_trace_header_written = true;
+    }
+    for(const auto& r : batch)
+    {
+        out << "\"" << r.kernel_name << "\","
+            << r.start_ns << ","
+            << r.end_ns << ","
+            << (r.end_ns - r.start_ns) << ","
+            << r.agent_id << ","
+            << r.queue_id << ","
+            << r.correlation_id << "\n";
+    }
+    g_trace_records_written += batch.size();
+}
+
 //
 // Counter dimension metadata (per counter_id)
 //
@@ -386,6 +462,16 @@ int tool_init(rocprofiler_client_finalize_t, void*)
         g_sample_interval_ms = std::atoi(env);
 
     g_trace_only = (std::getenv("CHOPPER_TRACE_ONLY") != nullptr);
+    {
+        // Same global-rank rule as the finalizer (RANK, else SLURM_PROCID,
+        // else LOCAL_RANK) so the periodic flush and the final write agree
+        // on the file name.
+        const char* r = std::getenv("RANK");
+        if(!r) r = std::getenv("SLURM_PROCID");
+        if(!r) r = std::getenv("LOCAL_RANK");
+        g_trace_path = resolve_trace_path(r ? std::string("_rank") + r : std::string());
+        std::clog << "[tool] kernel trace -> " << g_trace_path << "\n";
+    }
 
     std::clog << "[tool] Initializing with sample interval " << g_sample_interval_ms << " ms"
               << (g_trace_only ? " (trace-only mode, no device counters)" : "") << "\n";
@@ -527,10 +613,20 @@ int tool_init(rocprofiler_client_finalize_t, void*)
         {
             if(g_trace_only)
             {
+                long flush_ms = 5000;
+                if(auto* env = std::getenv("CHOPPER_TRACE_FLUSH_MS"); env)
+                    flush_ms = std::max(100L, std::atol(env));
+                auto last_disk_flush = std::chrono::steady_clock::now();
                 while(!g_exit.load())
                 {
                     rocprofiler_flush_buffer(g_trace_buffer);
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    auto now = std::chrono::steady_clock::now();
+                    if(now - last_disk_flush >= std::chrono::milliseconds(flush_ms))
+                    {
+                        flush_trace_records_to_disk();
+                        last_disk_flush = now;
+                    }
                 }
                 g_exit.store(false);
                 return;
@@ -653,54 +749,22 @@ void tool_fini(void*)
         std::clog << "[tool] Wrote rank info to " << info_path << "\n";
     }
 
-    // Write kernel traces CSV
+    // Write kernel traces CSV: whatever is still in memory goes through the
+    // same appender the sampling thread uses, so the file is complete
+    // whether or not periodic flushes happened.
     {
-        // CHOPPER_TRACE_PER_PID: one file per process, named the way the
-        // CUPTI tracer names its output (<stem>.<pid>.csv) so the same
-        // reader merges the siblings. A serving engine that forks a worker
-        // (vLLM's APIServer + EngineCore) loads this tool in both processes;
-        // with one shared name the last process to exit truncates the
-        // other's file, and an idle parent that dispatched nothing leaves an
-        // empty CSV where the real trace was. In this mode a process with no
-        // records writes nothing at all.
-        const bool  per_pid = std::getenv("CHOPPER_TRACE_PER_PID") != nullptr;
-        std::string suffix  = per_pid ? ("." + std::to_string(getpid())) : rank_suffix;
-        std::string path    = "kernel_traces" + suffix + ".csv";
-        if(auto* env = std::getenv("CHOPPER_TRACE_OUTPUT"); env)
-        {
-            path = env;
-            if(!suffix.empty())
-            {
-                auto dot = path.rfind('.');
-                if(dot != std::string::npos)
-                    path = path.substr(0, dot) + suffix + path.substr(dot);
-                else
-                    path += suffix;
-            }
-        }
-
-        std::lock_guard<std::mutex> lk(g_kernel_records_mutex);
-        if(per_pid && g_kernel_records.empty())
+        if(g_trace_path.empty()) g_trace_path = resolve_trace_path(rank_suffix);
+        const bool per_pid = std::getenv("CHOPPER_TRACE_PER_PID") != nullptr;
+        flush_trace_records_to_disk();
+        if(per_pid && g_trace_records_written == 0)
         {
             std::clog << "[tool] pid " << getpid() << " dispatched no kernels; "
-                      << "not writing " << path << "\n";
+                      << "not writing " << g_trace_path << "\n";
         }
         else
         {
-            std::ofstream out(path);
-            out << "kernel_name,start_ns,end_ns,duration_ns,agent_id,queue_id,correlation_id\n";
-            for(const auto& r : g_kernel_records)
-            {
-                out << "\"" << r.kernel_name << "\","
-                    << r.start_ns << ","
-                    << r.end_ns << ","
-                    << (r.end_ns - r.start_ns) << ","
-                    << r.agent_id << ","
-                    << r.queue_id << ","
-                    << r.correlation_id << "\n";
-            }
-            std::clog << "[tool] Wrote " << g_kernel_records.size()
-                      << " kernel records to " << path << "\n";
+            std::clog << "[tool] Wrote " << g_trace_records_written
+                      << " kernel records to " << g_trace_path << "\n";
         }
     }
 

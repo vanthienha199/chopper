@@ -303,6 +303,9 @@ def measure_command(
     logger.info(f"wrote {outdir}/{filename}: {len(df)} samples")
 
 
+_PERF_SW_EVENTS = frozenset({"task-clock", "cpu-clock", "context-switches",
+                             "cpu-migrations", "page-faults", "minor-faults",
+                             "major-faults"})
 _PERF_EVENTS = ("instructions", "cpu-cycles", "cache-references",
                 "cache-misses", "branches", "branch-misses")
 
@@ -335,7 +338,11 @@ def attach_pid(
     from chopper.profile.telemetry.cpu import _resolve_clock
     clock, clock_domain = _resolve_clock(cpu_clock)
 
-    events = ",".join(e + ":u" for e in _PERF_EVENTS)  # user-space, unprivileged
+    # Hardware events take the user-space modifier so an unprivileged attach
+    # works under perf_event_paranoid=2. Software clocks (task-clock,
+    # cpu-clock, context-switches, ...) reject ":u" and would come back as
+    # "<not supported>", so they go through bare.
+    events = ",".join(e if e in _PERF_SW_EVENTS else e + ":u" for e in _PERF_EVENTS)
     cmd = ["perf", "stat", "-p", str(pid), "-I", str(interval_ms), "-x", ",", "-e", events]
     logger.info(f"attaching perf to pid {pid}, events {_PERF_EVENTS} (clock={clock_domain})")
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
