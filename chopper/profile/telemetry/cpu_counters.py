@@ -362,10 +362,16 @@ def attach_pid(
         val = parts[1]
         event = parts[3].split(":")[0]
         row = rows.setdefault(itime, {"ts": clock(), "perf_interval_s": itime})
+        # hardware counts are integers; software clocks (task-clock, cpu-clock)
+        # come back as float milliseconds, and "<not counted>" / "<not
+        # supported>" stay None so a missing event is visible, never zero.
         try:
             row[event] = int(val)
         except ValueError:
-            row[event] = None
+            try:
+                row[event] = float(val)
+            except ValueError:
+                row[event] = None
         if end_at is None and duration_s > 0:
             end_at = time_monotonic() + duration_s
         if end_at is not None and time_monotonic() >= end_at:
