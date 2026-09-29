@@ -25,6 +25,8 @@
 //   CHOPPER_COUNTER_OUTPUT - counter CSV path (default: counter_samples.csv)
 //   CHOPPER_TRACE_OUTPUT   - trace CSV path (default: kernel_traces.csv)
 //   CHOPPER_TRACE_ONLY     - if set, collect dispatch traces only (no device counters)
+//   CHOPPER_TRACE_PER_PID  - if set, write <stem>.<pid>.csv per process (and
+//                            nothing from a process that dispatched no kernels)
 //
 // Rank semantics (multi-node):
 //   LOCAL_RANK  - selects which GPU on THIS node to profile. Repeats on every
@@ -653,35 +655,53 @@ void tool_fini(void*)
 
     // Write kernel traces CSV
     {
-        std::string path = "kernel_traces" + rank_suffix + ".csv";
+        // CHOPPER_TRACE_PER_PID: one file per process, named the way the
+        // CUPTI tracer names its output (<stem>.<pid>.csv) so the same
+        // reader merges the siblings. A serving engine that forks a worker
+        // (vLLM's APIServer + EngineCore) loads this tool in both processes;
+        // with one shared name the last process to exit truncates the
+        // other's file, and an idle parent that dispatched nothing leaves an
+        // empty CSV where the real trace was. In this mode a process with no
+        // records writes nothing at all.
+        const bool  per_pid = std::getenv("CHOPPER_TRACE_PER_PID") != nullptr;
+        std::string suffix  = per_pid ? ("." + std::to_string(getpid())) : rank_suffix;
+        std::string path    = "kernel_traces" + suffix + ".csv";
         if(auto* env = std::getenv("CHOPPER_TRACE_OUTPUT"); env)
         {
             path = env;
-            if(!rank_suffix.empty())
+            if(!suffix.empty())
             {
                 auto dot = path.rfind('.');
                 if(dot != std::string::npos)
-                    path = path.substr(0, dot) + rank_suffix + path.substr(dot);
+                    path = path.substr(0, dot) + suffix + path.substr(dot);
                 else
-                    path += rank_suffix;
+                    path += suffix;
             }
         }
 
-        std::ofstream out(path);
-        out << "kernel_name,start_ns,end_ns,duration_ns,agent_id,queue_id,correlation_id\n";
         std::lock_guard<std::mutex> lk(g_kernel_records_mutex);
-        for(const auto& r : g_kernel_records)
+        if(per_pid && g_kernel_records.empty())
         {
-            out << "\"" << r.kernel_name << "\","
-                << r.start_ns << ","
-                << r.end_ns << ","
-                << (r.end_ns - r.start_ns) << ","
-                << r.agent_id << ","
-                << r.queue_id << ","
-                << r.correlation_id << "\n";
+            std::clog << "[tool] pid " << getpid() << " dispatched no kernels; "
+                      << "not writing " << path << "\n";
         }
-        std::clog << "[tool] Wrote " << g_kernel_records.size()
-                  << " kernel records to " << path << "\n";
+        else
+        {
+            std::ofstream out(path);
+            out << "kernel_name,start_ns,end_ns,duration_ns,agent_id,queue_id,correlation_id\n";
+            for(const auto& r : g_kernel_records)
+            {
+                out << "\"" << r.kernel_name << "\","
+                    << r.start_ns << ","
+                    << r.end_ns << ","
+                    << (r.end_ns - r.start_ns) << ","
+                    << r.agent_id << ","
+                    << r.queue_id << ","
+                    << r.correlation_id << "\n";
+            }
+            std::clog << "[tool] Wrote " << g_kernel_records.size()
+                      << " kernel records to " << path << "\n";
+        }
     }
 
     // Write counter samples CSV (skip in trace-only mode)
