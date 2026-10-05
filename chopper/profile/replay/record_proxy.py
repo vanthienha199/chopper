@@ -9,7 +9,16 @@ turn (alias of seq, kept so older readers still work), ts_epoch_s
 0.0 for non-streaming when --no-ttft-upgrade is set, where first token time
 is not observable at the proxy), duration_s, prompt_sha256, prompt and
 completion token counts when the upstream reports usage, response text and
-tool_calls (OpenAI shape), finish_reasons, stream flag.
+tool_calls (flat {name, arguments, id}), finish_reasons, stream flag,
+protocol ("openai" for /chat/completions, "anthropic" for /v1/messages) and
+duration_includes_ttft (always true here).
+
+Both dialects are recorded: OpenAI chat-completions (mini-swe-agent, aider,
+opencode) and Anthropic messages (claude-code). Auth and version headers
+(Authorization, x-api-key, anthropic-version, anthropic-beta) are forwarded
+unchanged so the upstream sees the same request the harness sent. The
+non-streaming ttft upgrade applies to chat-completions only; claude-code
+always streams, so its first token is observed directly.
 
 Multi-request recording: several agent sessions may share one backend and
 one proxy. A single global turn counter would interleave their turns and
@@ -49,6 +58,7 @@ import hashlib
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -106,6 +116,72 @@ def _assemble_completion(sse_payload: str) -> dict:
             "choices": [{"index": 0, "message": message,
                          "finish_reason": finish or "stop"}],
             "usage": usage}
+
+
+def _parse_anthropic(payload: str, stream: bool) -> tuple:
+    """Text, flat tool_calls, stop reasons and token usage from an Anthropic
+    /v1/messages response, streamed (SSE events) or not (one message)."""
+    text, finish, p_tok, c_tok = "", [], 0, 0
+    blocks: dict[int, dict] = {}
+    if stream:
+        for line in payload.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                ev = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            kind = ev.get("type")
+            if kind == "message_start":
+                u = (ev.get("message") or {}).get("usage") or {}
+                p_tok = u.get("input_tokens", p_tok)
+                c_tok = u.get("output_tokens", c_tok)
+            elif kind == "content_block_start":
+                cb = ev.get("content_block") or {}
+                blocks[ev.get("index", len(blocks))] = {
+                    "type": cb.get("type"), "name": cb.get("name", ""),
+                    "id": cb.get("id", ""), "text": cb.get("text", ""),
+                    "json": ""}
+            elif kind == "content_block_delta":
+                d = ev.get("delta") or {}
+                b = blocks.setdefault(ev.get("index", 0), {
+                    "type": "text", "name": "", "id": "", "text": "", "json": ""})
+                if d.get("type") == "text_delta":
+                    b["text"] += d.get("text", "")
+                elif d.get("type") == "input_json_delta":
+                    b["json"] += d.get("partial_json", "")
+            elif kind == "message_delta":
+                d = ev.get("delta") or {}
+                if d.get("stop_reason"):
+                    finish.append(d["stop_reason"])
+                u = ev.get("usage") or {}
+                c_tok = u.get("output_tokens", c_tok)
+        ordered = [blocks[i] for i in sorted(blocks)]
+    else:
+        resp = json.loads(payload)
+        ordered = []
+        for cb in resp.get("content") or []:
+            ordered.append({"type": cb.get("type"), "name": cb.get("name", ""),
+                            "id": cb.get("id", ""), "text": cb.get("text", ""),
+                            "json": json.dumps(cb.get("input", {}))
+                            if cb.get("type") == "tool_use" else ""})
+        if resp.get("stop_reason"):
+            finish.append(resp["stop_reason"])
+        u = resp.get("usage") or {}
+        p_tok = u.get("input_tokens", 0)
+        c_tok = u.get("output_tokens", 0)
+    tool_calls = []
+    for b in ordered:
+        if b["type"] == "text":
+            text += b["text"]
+        elif b["type"] == "tool_use":
+            tool_calls.append({"name": b["name"], "arguments": b["json"] or "{}",
+                               "id": b["id"]})
+    return text, tool_calls, finish, p_tok, c_tok
+
+
+FORWARD_HEADERS = ("Authorization", "x-api-key", "anthropic-version",
+                   "anthropic-beta", "openai-organization")
 
 
 def _prompt_hash(body: dict) -> str:
@@ -208,6 +284,16 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 INFLIGHT -= 1
 
+    def _record(self, fields):
+        entry = {"schema_version": 9, "record": "model_call",
+                 "task_id": ARGS.task,
+                 "protocol": ("anthropic" if self.path.rstrip("/").endswith("/messages")
+                              else "openai"),
+                 "endpoint": self.path, **fields}
+        with LOCK:
+            with open(ARGS.out, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+
     def _forward(self, raw, body, session, seq, turn_in_session,
                  inflight_at_arrival):
         stream = bool(body.get("stream"))
@@ -226,6 +312,9 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
 
         fwd = {"Content-Type": "application/json"}
+        for h in FORWARD_HEADERS:
+            if self.headers.get(h):
+                fwd[h] = self.headers[h]
         if self.headers.get(SESSION_HEADER):
             # keep the session identity visible to the upstream (a mock
             # endpoint keys its per-session response stream on this)
@@ -288,6 +377,31 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
                     self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            # the upstream answered with an error: pass it through unchanged
+            # and record it, so a replay can serve the same failure
+            data = e.read()
+            dur = time.time() - t0
+            self.send_response(e.code)
+            self.send_header("Content-Type",
+                             e.headers.get("Content-Type", "application/json"))
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            self._record({
+                "seq": seq, "turn": seq, "session_id": session,
+                "turn_in_session": turn_in_session,
+                "inflight_at_arrival": inflight_at_arrival,
+                "ts_epoch_s": t0, "ttft_s": 0.0, "duration_s": round(dur, 4),
+                "duration_includes_ttft": True,
+                "prompt_sha256": _prompt_hash(body), "response": "",
+                "tool_calls": [], "finish_reasons": [], "stream": stream,
+                "error": data.decode(errors="replace")[:2000],
+                "http_status": e.code,
+            })
+            print(f"[record-proxy] call {seq} (session {session[:12]} turn "
+                  f"{turn_in_session}): upstream HTTP {e.code}, recorded")
+            return
         except Exception as e:
             self.send_response(502)
             self.end_headers()
@@ -296,9 +410,13 @@ class Handler(BaseHTTPRequestHandler):
         dur = time.time() - t0
 
         text, tool_calls, finish, p_tok, c_tok = "", [], [], 0, 0
+        anthropic = self.path.rstrip("/").endswith("/messages")
         try:
             payload = b"".join(chunks).decode()
-            if stream:
+            if anthropic:
+                text, tool_calls, finish, p_tok, c_tok = _parse_anthropic(
+                    payload, stream)
+            elif stream:
                 for line in payload.splitlines():
                     if line.startswith("data: ") and line != "data: [DONE]":
                         ev = json.loads(line[6:])
@@ -334,22 +452,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"[record-proxy] parse warning: {e}")
 
-        entry = {
-            "schema_version": 9, "record": "model_call",
-            "task_id": ARGS.task, "seq": seq, "turn": seq,
+        self._record({
+            "seq": seq, "turn": seq,
             "session_id": session, "turn_in_session": turn_in_session,
             "inflight_at_arrival": inflight_at_arrival,
             "ts_epoch_s": t0, "ttft_s": round(ttft, 4),
-            "duration_s": round(dur, 4),
+            "duration_s": round(dur, 4), "duration_includes_ttft": True,
             "prompt_tokens": p_tok, "completion_tokens": c_tok,
             "prompt_sha256": _prompt_hash(body),
             "response": text, "tool_calls": tool_calls,
             "finish_reasons": finish, "stream": stream,
-            "protocol": "openai", "endpoint": self.path,
-        }
-        with LOCK:
-            with open(ARGS.out, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+        })
         print(f"[record-proxy] call {seq} (session {session[:12]} turn "
               f"{turn_in_session}, {inflight_at_arrival} in flight on "
               f"arrival): {dur:.2f}s, {len(tool_calls)} tool_calls, "

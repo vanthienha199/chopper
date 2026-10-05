@@ -89,7 +89,12 @@ def decompose(model_calls: list[dict[str, Any]],
     turns: list[dict[str, Any]] = []
     for i, c in enumerate(calls):
         t0 = float(c.get("ts_epoch_s", 0.0))
-        model_s = float(c.get("ttft_s", 0.0)) + float(c.get("duration_s", 0.0))
+        if c.get("duration_includes_ttft"):
+            # proxy tape: duration_s already spans send -> response end
+            model_s = float(c.get("duration_s", 0.0))
+        else:
+            # mock journal: disjoint, sleep ttft then pace duration
+            model_s = float(c.get("ttft_s", 0.0)) + float(c.get("duration_s", 0.0))
         if i + 1 < len(calls):
             t1 = float(calls[i + 1].get("ts_epoch_s", t0 + model_s))
         else:

@@ -287,6 +287,34 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             GATE.release()
 
+    def _replay_error(self, call: dict[str, Any], session: str,
+                      turn_in_session: int, t_arrival: float,
+                      queue_wait: float, inflight_at_arrival: int) -> None:
+        assert REC is not None
+        wait = float(call.get("duration_s", 0.0)) / REC.speed
+        time.sleep(wait)
+        err = call.get("error")
+        msg = err if isinstance(err, str) else json.dumps(err)
+        status = int(call.get("http_status") or 500)
+        REC.log_served({
+            "turn": call.get("turn", turn_in_session),
+            "task_id": call.get("task_id"),
+            "session_id": session, "turn_in_session": turn_in_session,
+            "ts_arrival_epoch_s": t_arrival, "ts_epoch_s": time.time(),
+            "inflight_at_arrival": inflight_at_arrival,
+            "queue_wait_s": round(queue_wait, 6),
+            "ttft_s": 0.0, "duration_s": wait, "duration_includes_ttft": False,
+            "error": msg, "http_status": status,
+        })
+        if self.path.startswith("/v1/messages"):
+            self._json(status, {"type": "error",
+                                "error": {"type": "api_error", "message": msg}})
+        else:
+            self._json(status, {"error": {"message": msg, "type": "replayed_error",
+                                          "code": status}})
+        print(f"[mock-endpoint] session {session[:12]} turn {turn_in_session}: "
+              f"replayed recorded error as HTTP {status}")
+
     def _serve(self, body: dict[str, Any], session: str, t_arrival: float,
                queue_wait: float, inflight_at_arrival: int) -> None:
         assert REC is not None and ARGS is not None
@@ -306,11 +334,21 @@ class Handler(BaseHTTPRequestHandler):
                       f"{turn_in_session}: prompt hash mismatch (replay "
                       f"diverged from recording), serving anyway")
 
+        if call.get("error") and ARGS.on_error == "serve":
+            # the original turn failed upstream; give the harness the same
+            # failure instead of a silent empty answer it never saw
+            self._replay_error(call, session, turn_in_session, t_arrival,
+                               queue_wait, inflight_at_arrival)
+            return
         text = call.get("response") or ""
         tools = _norm_tool_calls(call.get("tool_calls"))
         finish = _finish_reason(call, tools)
         ttft = float(call.get("ttft_s", 0.0)) / REC.speed
         dur = float(call.get("duration_s", 0.0)) / REC.speed
+        if call.get("duration_includes_ttft"):
+            # proxy tapes time duration_s from send to response end, so the
+            # body is paced over what is left after the first token
+            dur = max(dur - ttft, 0.0)
         REC.log_served({
             "turn": call.get("turn", turn_in_session),
             "task_id": call.get("task_id"),
@@ -319,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
             "ts_epoch_s": time.time(),
             "inflight_at_arrival": inflight_at_arrival,
             "queue_wait_s": round(queue_wait, 6),
-            "ttft_s": ttft, "duration_s": dur,
+            "ttft_s": ttft, "duration_s": dur, "duration_includes_ttft": False,
             "prompt_tokens": call.get("prompt_tokens", 0),
             "completion_tokens": call.get("completion_tokens", 0),
         })
@@ -500,6 +538,10 @@ def main() -> None:
                         "reachable from another node and also exposes the "
                         "port on this node")
     p.add_argument("--port", type=int, default=8123)
+    p.add_argument("--on-error", choices=["serve", "empty"], default="serve",
+                   help="recorded turns whose upstream call failed: 'serve' "
+                        "replays the failure as an HTTP error (default), "
+                        "'empty' serves an empty answer as before")
     p.add_argument("--max-concurrency", type=int, default=None,
                    help="serve at most this many requests at once; the rest "
                         "wait in a FIFO queue and the imposed wait is "

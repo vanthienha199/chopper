@@ -48,8 +48,18 @@ session fields; readers should treat them as one session.
 `duration_s` from the proxy spans request send to response end and already
 contains `ttft_s`. The mock endpoint's own replay journal uses the opposite,
 disjoint convention (sleep `ttft_s`, then pace the body over `duration_s`).
-decompose.py reads the mock journal, multi_request.py reads the proxy
-recording; each applies the convention of its input.
+Every row says which one it is: `duration_includes_ttft: true` on proxy
+tapes, `false` (or absent, in files written before this field existed) on
+mock journals. decompose.py and mock_endpoint.py both read the flag, so
+either file can be fed to either tool without a projection step: an
+inclusive tape is paced as ttft then (duration - ttft), and its model wait
+is duration. multi_request.py reads the proxy tape and treats a row without
+the flag as inclusive, as before.
+
+A row with `error` set (the upstream call failed) is replayed by the mock as
+the same failure: HTTP `http_status` (default 500) with the error message,
+in the dialect of the endpoint asked. `--on-error empty` restores the old
+behavior of serving an empty answer.
 
 The mocked endpoint (chopper.profile.replay.mock_endpoint) serves exactly
 this file back, FIFO within a session, with the recorded timing. Most agent turns carry
