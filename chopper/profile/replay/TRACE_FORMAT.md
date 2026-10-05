@@ -92,17 +92,21 @@ need to change its output format.
 
 ## Telemetry layer
 
-Existing chopper collectors, unchanged semantics, one row schema each
-(current pickles already match; parquet is a re-encoding):
+Existing chopper collectors, unchanged semantics, one row schema each.
+These are the columns the pickles actually carry (checked against the
+collectors; parquet is a re-encoding). Every collector also writes `node`
+(hostname) for multi-node runs.
 
-| file          | key columns                                             |
-|---------------|---------------------------------------------------------|
-| gpu_telemetry | ts, gpu, power_w, temp_c, sclk, mclk, util              |
-| cpu_samples   | ts, core, util_pct                                      |
-| agents        | ts, agent, pid, name, cpu, percent, sweep_s             |
-| io            | ts, agent, pid, read_bytes, write_bytes, counts         |
-| cpu_counters  | ts, instructions, cpu_cycles, cache_references, misses  |
-| kernel_traces | kernel_name, start_ns, end_ns, duration_ns              |
+| file (pickle)          | key columns                                                                 |
+|------------------------|-----------------------------------------------------------------------------|
+| gpu.pkl, NVIDIA        | ts, gpu, power_w, power_limit_w, temp_c, sm_clock_mhz, mem_clock_mhz, gfx_clock_mhz, gpu_util_pct, mem_util_pct, node |
+| gpu.pkl, AMD           | ts, gpu, plus every field of amdsmi_get_gpu_metrics_info, node              |
+| cpu.pkl                | cpu, ts, percent, name, cmdline, node                                       |
+| agents.pkl             | ts, agent, pid, name, cpu, percent, sweep_s, node                           |
+| io.pkl                 | ts, agent, pid, name, read_bytes, write_bytes, read_count, write_count, node |
+| cpu_counters.pkl, launch | ts, one column per counter (instructions, cpu_cycles, cache_references, cache_misses, task_clock_ns, ...), node |
+| cpu_counters.pkl, attach | ts, perf_interval_s, one column per perf event (instructions, cpu-cycles, task-clock, ...), node; attrs perf_events / perf_dropped |
+| kernel_traces          | kernel_name, start_ns, end_ns, duration_ns                                  |
 
 Kernel rows include `[cuda_graph N]` graph launches and `[nvtx_begin/end]`
 operator range boundaries, so the kernel->operator mapping lives in the
