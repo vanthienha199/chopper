@@ -307,7 +307,81 @@ _PERF_SW_EVENTS = frozenset({"task-clock", "cpu-clock", "context-switches",
                              "cpu-migrations", "page-faults", "minor-faults",
                              "major-faults"})
 _PERF_EVENTS = ("instructions", "cpu-cycles", "cache-references",
-                "cache-misses", "branches", "branch-misses")
+                "cache-misses", "branches", "branch-misses", "task-clock")
+
+
+def _event_spec(event: str, user_only: bool) -> str:
+    """Software clocks reject the :u modifier, hardware events take it so an
+    unprivileged attach works under perf_event_paranoid=2."""
+    if event in _PERF_SW_EVENTS or not user_only or ":" in event:
+        return event
+    return event + ":u"
+
+
+def _parse_perf_csv(text: str) -> dict:
+    """Event -> True (counted), False (<not supported>) from `perf stat -x ,`
+    output. <not counted> means the event exists but the task did not run in
+    the window, which is not a reason to drop it."""
+    seen: dict = {}
+    for line in text.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 3:
+            continue
+        # non-interval CSV: <value>,<unit>,<event>,...
+        event = parts[2].split(":")[0]
+        if not event:
+            continue
+        seen[event] = parts[0] != "<not supported>"
+    return seen
+
+
+def _resolve_events(events) -> tuple:
+    if events:
+        return tuple(events)
+    env = os.environ.get("CHOPPER_PERF_EVENTS", "").strip()
+    if env:
+        return tuple(e.strip() for e in env.split(",") if e.strip())
+    return _PERF_EVENTS
+
+
+def _probe_events(pid: int, events: tuple, window_s: float = 0.1) -> tuple:
+    """Ask perf which events it can count on this pid before recording, so an
+    unsupported event is dropped (and named) instead of becoming a column of
+    None for the whole run. Hardware events are tried with :u first and again
+    bare if that is refused (some PMUs, e.g. on GH200 nodes, reject :u).
+    Returns (specs to record, dropped events)."""
+    import subprocess
+
+    def run(specs):
+        cmd = ["perf", "stat", "-x", ",", "-p", str(pid), "-e", ",".join(specs),
+               "--", "sleep", str(window_s)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except Exception as e:  # perf missing, timeout
+            logger.warning(f"perf probe failed: {e}")
+            return {}
+        return _parse_perf_csv(r.stderr)
+
+    first = run([_event_spec(e, True) for e in events])
+    keep, retry = [], []
+    for e in events:
+        if first.get(e):
+            keep.append(_event_spec(e, True))
+        else:
+            retry.append(e)
+    dropped = []
+    if retry:
+        second = run(list(retry))
+        for e in retry:
+            if second.get(e):
+                keep.append(e)
+            else:
+                dropped.append(e)
+    if not first and not keep:
+        # the probe itself produced nothing (perf refused the whole set);
+        # record the request as given and let the run show what happened
+        return tuple(_event_spec(e, True) for e in events), []
+    return tuple(keep), dropped
 
 
 def attach_pid(
@@ -317,6 +391,8 @@ def attach_pid(
     cpu_clock: str = "monotonic",
     interval_ms: int = 200,
     duration_s: float = 0.0,
+    events=None,
+    probe: bool = True,
 ):
     """Attach to an ALREADY-RUNNING process (e.g. a vLLM server) and record its
     CPU hardware counters over time, without launching it.
@@ -328,6 +404,12 @@ def attach_pid(
 
     This is the hook for profiling Suhas's vLLM run: start his server, get its
     pid, attach.
+
+    events: perf event names to record. Default: `events` argument, else the
+    comma list in CHOPPER_PERF_EVENTS, else _PERF_EVENTS (which includes
+    task-clock, so host busy time is measured on this path too). With
+    probe=True each event is checked against the pid first and anything perf
+    cannot count is dropped and listed in df.attrs["perf_dropped"].
     """
     import shutil
     import subprocess
@@ -338,13 +420,19 @@ def attach_pid(
     from chopper.profile.telemetry.cpu import _resolve_clock
     clock, clock_domain = _resolve_clock(cpu_clock)
 
-    # Hardware events take the user-space modifier so an unprivileged attach
-    # works under perf_event_paranoid=2. Software clocks (task-clock,
-    # cpu-clock, context-switches, ...) reject ":u" and would come back as
-    # "<not supported>", so they go through bare.
-    events = ",".join(e if e in _PERF_SW_EVENTS else e + ":u" for e in _PERF_EVENTS)
-    cmd = ["perf", "stat", "-p", str(pid), "-I", str(interval_ms), "-x", ",", "-e", events]
-    logger.info(f"attaching perf to pid {pid}, events {_PERF_EVENTS} (clock={clock_domain})")
+    wanted = _resolve_events(events)
+    if probe:
+        specs, dropped = _probe_events(pid, wanted)
+    else:
+        specs, dropped = tuple(_event_spec(e, True) for e in wanted), []
+    if dropped:
+        logger.warning(f"perf cannot count {dropped} on pid {pid}; dropped")
+    if not specs:
+        logger.warning(f"no perf event is countable on pid {pid}; nothing to record")
+        return
+    cmd = ["perf", "stat", "-p", str(pid), "-I", str(interval_ms), "-x", ",",
+           "-e", ",".join(specs)]
+    logger.info(f"attaching perf to pid {pid}, events {specs} (clock={clock_domain})")
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
 
     rows: dict = {}
@@ -385,6 +473,8 @@ def attach_pid(
     df.attrs["clock_domain"] = clock_domain
     if SW_COUNTER_SCOPE:
         df.attrs["sw_counter_scope"] = dict(SW_COUNTER_SCOPE)
+    df.attrs["perf_events"] = list(specs)
+    df.attrs["perf_dropped"] = list(dropped)
     df.to_pickle(f"{outdir}/{filename}")
     logger.info(f"wrote {outdir}/{filename}: {len(df)} intervals from pid {pid}")
 
@@ -416,12 +506,20 @@ if __name__ == "__main__":
                         help="attach to an already-running process instead of launching one")
     parser.add_argument("--interval-ms", type=int, default=200, help="perf interval for --attach")
     parser.add_argument("--duration", type=float, default=0.0, help="seconds to profile with --attach (0=until it exits)")
+    parser.add_argument("--events", default=None,
+                        help="comma list of perf events for --attach (default: "
+                             "CHOPPER_PERF_EVENTS, else the built-in set)")
+    parser.add_argument("--no-probe", action="store_true",
+                        help="record the --attach events as given, without "
+                             "checking first which ones perf can count")
     parser.add_argument("program", nargs="*", help="workload to run and measure")
     args = parser.parse_args()
     if args.attach:
         attach_pid(args.attach, args.filename, args.output_dir,
                    cpu_clock=args.cpu_clock, interval_ms=args.interval_ms,
-                   duration_s=args.duration)
+                   duration_s=args.duration,
+                   events=args.events.split(",") if args.events else None,
+                   probe=not args.no_probe)
     else:
         kw = {"cpu_clock": args.cpu_clock, "off": args.off}
         if args.counters:

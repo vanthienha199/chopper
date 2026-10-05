@@ -45,8 +45,16 @@ def _interp(df: pd.DataFrame, col: str, t_ns: float) -> float:
 
 def per_turn(counters: pd.DataFrame, journal: list[dict],
              anchor: dict) -> list[dict]:
-    cdf = counters.dropna().reset_index(drop=True)
-    cols = [c for c in cdf.columns if c != "ts"]
+    # counter columns only: attach-mode pickles also carry "node" (hostname)
+    # and "perf_interval_s", and an event perf could not count is all None.
+    # Select numeric counters explicitly, drop the empty ones, then drop rows.
+    skip = {"ts", "perf_interval_s"}
+    numeric = counters.apply(pd.to_numeric, errors="coerce")
+    # a text column (hostname) coerces to all-NaN, an uncounted event is all
+    # None; both drop out here
+    cols = [c for c in counters.columns
+            if c not in skip and numeric[c].notna().any()]
+    cdf = numeric[["ts"] + cols].dropna().reset_index(drop=True)
 
     def epoch_to_mono_ns(epoch_s: float) -> float:
         return (epoch_s - anchor["epoch_s"]) * 1e9 + anchor["monotonic_ns"]
@@ -62,7 +70,13 @@ def per_turn(counters: pd.DataFrame, journal: list[dict],
         row = {"turn": c.get("turn", i),
                "window_s": round((t1 - t0) / 1e9, 4)}
         for col in cols:
-            row[col] = int(_interp(cdf, col, t1) - _interp(cdf, col, t0))
+            delta = _interp(cdf, col, t1) - _interp(cdf, col, t0)
+            # counts are integers; software clocks (task-clock) are float ms
+            # attach-mode perf names use hyphens (cpu-cycles); the launch
+            # path uses underscores. One spelling downstream.
+            row[col.replace("-", "_")] = (
+                int(delta) if pd.api.types.is_integer_dtype(counters[col])
+                else round(float(delta), 3))
         if row.get("cpu_cycles"):
             row["ipc"] = round(row.get("instructions", 0)
                                / row["cpu_cycles"], 3)
