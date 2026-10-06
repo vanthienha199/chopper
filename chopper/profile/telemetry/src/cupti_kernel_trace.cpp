@@ -160,14 +160,25 @@ void CUPTIAPI bufferCompleted(CUcontext, uint32_t, uint8_t* buffer,
 // SUCCESS, while the matched CUPTI 13 build delivered 1.47M records from the
 // identical workload). flushAll cannot detect this, so the stall check is the
 // only tell. With CHOPPER_NV_TRACE_HEARTBEAT=1 also print counters per beat.
-void watchdog(bool verbose) {
+//
+// A second, version-matched cause (DeltaAI GH200, vLLM 0.29 cu129, CUPTI 12.9,
+// gpt-oss-120b, jobs 3317383 and 3321631): delivery stops at the first long
+// decode while CUPTI's own worker threads sit idle and our callback is not on
+// any stack. A non-forced flush only hands back buffers whose records are all
+// complete, and CUPTI delivers in order, so one record that never completes
+// holds back every buffer after it. Once the stall signature is seen the
+// watchdog switches to forced flushes, which deliver the held buffers and drop
+// only the incomplete records. CHOPPER_NV_FORCED_FLUSH=1 forces from the start.
+void watchdog(bool verbose, bool force_always) {
     uint64_t last = 0;
     uint64_t last_done = 0;
     int stalled_beats = 0;
     bool warned = false;
+    bool forcing = force_always;
     while (g_active) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
-        CUptiResult rc = cuptiActivityFlushAll(0);
+        CUptiResult rc = cuptiActivityFlushAll(
+            forcing ? CUPTI_ACTIVITY_FLAG_FLUSH_FORCED : 0);
         uint64_t n = g_count.load();
         uint64_t req = g_buf_req.load(), done = g_buf_done.load();
         if (verbose) {
@@ -189,6 +200,18 @@ void watchdog(bool verbose) {
                     "toolkit the app ships, e.g. site-packages/nvidia/cu13.\n",
                     (int)getpid(), (unsigned long long)req,
                     (unsigned long long)done, (unsigned long long)n);
+        }
+        if (stalled_beats >= 3 && !forcing) {
+            forcing = true;
+            fprintf(stderr,
+                    "[cupti-trace] pid %d: switching to forced flushes to recover "
+                    "held buffers (incomplete records are dropped)\n", (int)getpid());
+        }
+        if (forcing && warned && done > last_done) {
+            fprintf(stderr,
+                    "[cupti-trace] pid %d: forced flush recovered %llu buffer(s), "
+                    "records now %llu\n", (int)getpid(),
+                    (unsigned long long)(done - last_done), (unsigned long long)n);
         }
         last = n;
         last_done = done;
@@ -296,7 +319,8 @@ extern "C" int InitializeInjection(void) {
     }
     g_active = true;
     const char* hb = getenv("CHOPPER_NV_TRACE_HEARTBEAT");
-    std::thread(watchdog, hb && hb[0] == '1').detach();
+    const char* ff = getenv("CHOPPER_NV_FORCED_FLUSH");
+    std::thread(watchdog, hb && hb[0] == '1', ff && ff[0] == '1').detach();
     atexit(finalize);
     fprintf(stderr, "[cupti-trace] pid %d injection initialized (CUPTI %u) -> %s\n",
             (int)getpid(), rt_version, out.c_str());
