@@ -194,10 +194,10 @@ void watchdog(bool verbose, bool force_always) {
             fprintf(stderr,
                     "[cupti-trace] WARNING pid %d: CUPTI stopped delivering activity "
                     "buffers (%llu requested, %llu completed, records frozen at %llu). "
-                    "Kernel records from here on are LOST. Known cause: tracer built "
-                    "against a CUPTI older than the app's CUDA runtime (e.g. cluster "
-                    "CUDA module vs torch's bundled toolkit). Rebuild against the "
-                    "toolkit the app ships, e.g. site-packages/nvidia/cu13.\n",
+                    "Switching to forced flushes, which recovers the held buffers. "
+                    "If records stay frozen after that, the tracer is likely built "
+                    "against a CUPTI older than the app's CUDA runtime: rebuild "
+                    "against the toolkit the app ships (site-packages/nvidia/...).\n",
                     (int)getpid(), (unsigned long long)req,
                     (unsigned long long)done, (unsigned long long)n);
         }
