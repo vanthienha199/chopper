@@ -417,6 +417,11 @@ class Handler(BaseHTTPRequestHandler):
                 text, tool_calls, finish, p_tok, c_tok = _parse_anthropic(
                     payload, stream)
             elif stream:
+                # a streamed tool call arrives as many deltas: the first one
+                # carries id and name, the rest carry argument fragments,
+                # all under the same index. Assemble by index; one entry
+                # per delta would count every fragment as a tool call.
+                slots: dict = {}
                 for line in payload.splitlines():
                     if line.startswith("data: ") and line != "data: [DONE]":
                         ev = json.loads(line[6:])
@@ -425,15 +430,20 @@ class Handler(BaseHTTPRequestHandler):
                             text += d.get("content") or ""
                             for tc in d.get("tool_calls") or []:
                                 f = tc.get("function", {})
-                                tool_calls.append({
-                                    "name": f.get("name", ""),
-                                    "arguments": f.get("arguments", ""),
-                                    "id": tc.get("id", "")})
+                                slot = slots.setdefault(
+                                    tc.get("index", len(slots)),
+                                    {"name": "", "arguments": "", "id": ""})
+                                if tc.get("id"):
+                                    slot["id"] = tc["id"]
+                                if f.get("name"):
+                                    slot["name"] = f["name"]
+                                slot["arguments"] += f.get("arguments") or ""
                             if ch.get("finish_reason"):
                                 finish.append(ch["finish_reason"])
                         u = ev.get("usage") or {}
                         p_tok = u.get("prompt_tokens", p_tok)
                         c_tok = u.get("completion_tokens", c_tok)
+                tool_calls = [slots[i] for i in sorted(slots)]
             else:
                 resp = json.loads(payload)
                 for ch in resp.get("choices", []):
