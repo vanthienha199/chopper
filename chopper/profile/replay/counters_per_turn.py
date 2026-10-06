@@ -11,6 +11,14 @@ Inputs:
                back-to-back on the same machine, to convert journal epochs
                onto the counter clock
 
+Two counter shapes exist. measure_command (launch path) records CUMULATIVE
+counts; attach_pid (perf stat -I, the path gridbench uses on a running vLLM
+server) records a count PER INTERVAL. Interval counts are summed into a
+running total first; differencing them directly gives meaningless, sometimes
+negative, numbers. The shape is read from attrs["counter_kind"] when present,
+else from a perf_interval_s column, else from the data (a cumulative counter
+never decreases).
+
 Per turn (model call k arrival -> call k+1 arrival) the cumulative counters
 are linearly interpolated at both edges and differenced:
   instructions, cpu_cycles, cache_references, cache_misses, ipc,
@@ -43,6 +51,16 @@ def _interp(df: pd.DataFrame, col: str, t_ns: float) -> float:
     return float(v[i - 1] + f * (v[i] - v[i - 1]))
 
 
+def _is_interval(raw: pd.DataFrame, cdf: pd.DataFrame, cols: list) -> bool:
+    kind = raw.attrs.get("counter_kind")
+    if kind in ("interval", "cumulative"):
+        return kind == "interval"
+    if "perf_interval_s" in raw.columns:
+        return True
+    # a cumulative counter never goes down; per-interval counts do
+    return any((cdf[c].diff().dropna() < 0).any() for c in cols)
+
+
 def per_turn(counters: pd.DataFrame, journal: list[dict],
              anchor: dict) -> list[dict]:
     # counter columns only: attach-mode pickles also carry "node" (hostname)
@@ -55,6 +73,8 @@ def per_turn(counters: pd.DataFrame, journal: list[dict],
     cols = [c for c in counters.columns
             if c not in skip and numeric[c].notna().any()]
     cdf = numeric[["ts"] + cols].dropna().reset_index(drop=True)
+    if _is_interval(counters, cdf, cols):
+        cdf[cols] = cdf[cols].cumsum()
 
     def epoch_to_mono_ns(epoch_s: float) -> float:
         return (epoch_s - anchor["epoch_s"]) * 1e9 + anchor["monotonic_ns"]
@@ -75,7 +95,7 @@ def per_turn(counters: pd.DataFrame, journal: list[dict],
             # attach-mode perf names use hyphens (cpu-cycles); the launch
             # path uses underscores. One spelling downstream.
             row[col.replace("-", "_")] = (
-                int(delta) if pd.api.types.is_integer_dtype(counters[col])
+                int(round(delta)) if pd.api.types.is_integer_dtype(counters[col])
                 else round(float(delta), 3))
         if row.get("cpu_cycles"):
             row["ipc"] = round(row.get("instructions", 0)

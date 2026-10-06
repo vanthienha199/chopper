@@ -299,6 +299,7 @@ def measure_command(
     df.attrs["clock_domain"] = clock_domain
     if SW_COUNTER_SCOPE:
         df.attrs["sw_counter_scope"] = dict(SW_COUNTER_SCOPE)
+    df.attrs["counter_kind"] = "cumulative"
     df.to_pickle(f"{outdir}/{filename}")
     logger.info(f"wrote {outdir}/{filename}: {len(df)} samples")
 
@@ -475,6 +476,8 @@ def attach_pid(
         df.attrs["sw_counter_scope"] = dict(SW_COUNTER_SCOPE)
     df.attrs["perf_events"] = list(specs)
     df.attrs["perf_dropped"] = list(dropped)
+    # perf stat -I reports the count during each interval, not a running total
+    df.attrs["counter_kind"] = "interval"
     df.to_pickle(f"{outdir}/{filename}")
     logger.info(f"wrote {outdir}/{filename}: {len(df)} intervals from pid {pid}")
 
